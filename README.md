@@ -11,16 +11,25 @@ sample set.
 
 ## Status
 
+**0.5.2 is released** — download the `.nvda-addon` from
+[Releases](https://github.com/borris84/dectalk-dtc01/releases/latest). The
+add-on checks for later releases itself and offers to install them.
+
 Working and in daily use. Speech, all eight built-in voices, rate, volume,
 and the firmware's Design Voice parameters are functional, along with
 say-all, index reporting, and rate boost beyond the hardware's own ceiling.
 
 | | |
 |---|---|
+| Latest release | 0.5.2 |
 | Emulation speed | ~10x realtime (native C core) |
 | Startup | ~0.5s to first speech |
 | Latency | ~50ms typical from request to audio |
 | NVDA | 2026.1 (x64); built and tested against 2026.1.1 |
+
+Installed from the published package and verified on NVDA 2026.1.1 AMD64.
+The 32-bit core ships in the same package but has not been run on a 32-bit
+NVDA.
 
 ## Requirements
 
