@@ -21,7 +21,7 @@ from logHandler import log
 
 ADDON_NAME = "dectalkDtc01"
 # Set this to the published repository. Until then the check is inert.
-GITHUB_REPO = ""          # e.g. "patrickperdue/dectalk-dtc01"
+GITHUB_REPO = "borris84/dectalk-dtc01"
 
 RELEASES_URL = "https://api.github.com/repos/%s/releases/latest"
 USER_AGENT = "DECtalk DTC-01 NVDA add-on updater"
