@@ -79,10 +79,18 @@ Packaging refuses to run if any NVDA symbol the add-on imports is missing
 from your installed NVDA (`tools/check_nvda_api.py`), and the add-on is
 verified to contain no ROM data.
 
-⚠ **Musashi's `m68kmake` must be compiled `/Od`.** At `/O2` MSVC miscompiles
-it and every generated opcode mask loses a bit, which makes `m68k_init()`
-crash before a single instruction runs. `native/musashi/VENDORING.md` has the
-details and a verification recipe.
+Musashi's opcode tables are generated rather than checked in; the build
+script produces them on first run and verifies them.
+
+⚠ That step compiles `m68kmake` with `/Od` **deliberately**. At `/O2` MSVC
+miscompiles it: every generated opcode mask loses bit 14, so none carries
+the `0xff00` mask Musashi's own table builder scans for as a terminator, the
+scan runs off the end of the array, and `m68k_init()` dies with an access
+violation before a single instruction executes. It presents as "the DLL
+loads but creating a machine crashes", nowhere near the real cause. The
+build script checks the generated tables for that mask group and fails
+loudly rather than handing you a DLL that crashes at runtime.
+`native/musashi/VENDORING.md` has the full detail.
 
 ## Development
 

@@ -31,6 +31,11 @@ rem dtc01.c (scheduler) and tms32010.c (DSP core).
 rem Suppressed warnings are all from vendored Musashi/softfloat, not our code.
 set "CFLAGS=/nologo /O2 /GL /MT /W3 /wd4146 /wd4996 /wd4244 /wd4018 /wd4090"
 
+rem Musashi's opcode tables are generated, not checked in. Produce them if
+rem missing, before anything tries to compile m68kops.c.
+if not exist "%NATIVE%\musashi\m68kops.c" call :genops
+if errorlevel 1 exit /b 1
+
 set "WHICH=%~1"
 if "%WHICH%"=="" goto :both
 if /i "%WHICH%"=="x64" goto :only_x64
@@ -64,6 +69,50 @@ exit /b 0
 
 :no_vcvars
 echo ERROR: vcvarsall.bat not found at "%VCVARS%"
+exit /b 1
+
+rem ---- :genops -- generate Musashi's opcode tables ---------------------
+rem
+rem m68kmake MUST be compiled /Od. At /O2 MSVC miscompiles it: every
+rem generated opcode mask and match loses bit 14, so no entry ends up with
+rem the 0xff00 mask that Musashi's own table builder scans for as a
+rem terminator. The scan then runs off the end of the array and m68k_init()
+rem dies with an access violation before a single instruction executes --
+rem which presents as "the DLL loads but dtc01_create() crashes", nowhere
+rem near the real cause. See native/musashi/VENDORING.md.
+:genops
+setlocal
+echo.
+echo === generating Musashi opcode tables (m68kmake, /Od -- see VENDORING.md) ===
+call "%VCVARS%" x64 >nul 2>&1
+if errorlevel 1 goto :genops_fail
+pushd "%NATIVE%\musashi"
+cl /nologo /Od /Fe:m68kmake.exe m68kmake.c
+if errorlevel 1 goto :genops_fail_pop
+rem ".\" is required: cmd does not always search the current directory.
+.\m68kmake.exe . m68k_in.c
+if errorlevel 1 goto :genops_fail_pop
+if not exist m68kops.c goto :genops_fail_pop
+rem Sanity check: the 0xff00 group must exist, or the tables are miscompiled
+rem output and m68k_init() will crash. Better to fail here than at runtime.
+findstr /c:", 0xff00, " m68kops.c >nul
+if errorlevel 1 (
+  echo ERROR: generated m68kops.c has no 0xff00 mask group.
+  echo        m68kmake was miscompiled -- it must be built /Od.
+  del /q m68kops.c m68kops.h 2>nul
+  goto :genops_fail_pop
+)
+del /q m68kmake.exe m68kmake.obj 2>nul
+popd
+echo     opcode tables generated and verified
+endlocal
+exit /b 0
+
+:genops_fail_pop
+popd
+:genops_fail
+echo ERROR: could not generate Musashi opcode tables
+endlocal
 exit /b 1
 
 rem ---- :build <out-tag> <vcvars-arch> ----------------------------------
