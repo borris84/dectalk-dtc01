@@ -1,0 +1,68 @@
+# ---------------------------------------------------------------------------
+# Copyrighted firmware -- MUST NEVER BE COMMITTED (see DESIGN.md §0)
+#
+# The DTC-01 main-CPU and DSP ROMs are Digital Equipment Corp / Fonix
+# firmware. Users supply their own dump. tools/check_no_roms.py enforces
+# this by content hash; it is not left to these patterns alone.
+# ---------------------------------------------------------------------------
+roms_extracted/
+dectalk.zip
+*.e1
+*.e2
+*.e3
+*.e4
+*.e5
+*.e6
+*.e7
+*.e8
+*.e15
+*.e16
+*.e17
+*.e18
+*.e19
+*.e20
+*.e21
+*.e22
+*.e69
+*.e70
+
+# Assembled ROM images and anything derived from them
+build/maincpu.bin
+build/dsp.bin
+*.rom
+
+# The OCR'd DTC-01 Owner's Manual is DEC copyright, and the MAME/Musashi
+# reference copies belong to their own projects -- DESIGN.md cites where to
+# obtain each. Keep the local working copies out of the repo.
+research/
+
+# ---------------------------------------------------------------------------
+# Build output
+# ---------------------------------------------------------------------------
+build/
+!build/.gitkeep
+
+# Musashi's generated opcode tables are reproduced by tools/build_native.bat
+# (m68kmake must be built /Od -- see native/musashi/VENDORING.md).
+native/musashi/m68kops.c
+native/musashi/m68kops.h
+native/musashi/m68kmake.exe
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.dll
+*.exe
+
+# ---------------------------------------------------------------------------
+# Python / editor
+# ---------------------------------------------------------------------------
+__pycache__/
+*.pyc
+*.pyo
+.vscode/
+.idea/
+
+# Local Claude Code tool permissions -- not project material
+.claude/

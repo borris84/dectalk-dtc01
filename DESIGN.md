@@ -1,0 +1,996 @@
+# DECtalk DTC-01 → NVDA Synth Driver: Design Reference
+
+Ground truth for a multi-session build. Do not re-derive these facts from
+memory — they were pulled from the actual MAME driver source and the 1984
+DTC-01 Owner's Manual (OCR). Sources are cited inline.
+
+## 0. Legal / asset handling
+
+- The DTC-01 main-CPU ROMs and DSP ROMs are Digital Equipment Corp / Fonix
+  copyrighted firmware. They are **never** committed to this repo and
+  **never** shipped inside the `.nvda-addon` package.
+- `roms_extracted/` at the project root holds the user's own dumped ROM set
+  for local development/testing only. Verified against MAME's known-good
+  SHA1 hashes (see §2) — all 16 main-CPU v2.0 ROMs and the DSP `204/205`
+  pair matched exactly.
+- The shipped addon ships zero ROM bytes. On first run it points the user
+  at a config folder and validates checksums via `tools/rom_loader.py`
+  logic before allowing the synth to start.
+- Two files in the user's zip are *not* part of the MAME `dectalk` ROM_START
+  and are unused/unexplained: `chargen-15ie.bin` (2048B) and `dump1.bin`/
+  `dump5.bin` (4096B each). Leave them alone — not needed for this driver.
+
+## 1. Hardware architecture
+
+Source: `src/mame/dec/dectalk.cpp` (MAME, BSD-3-Clause, Jonathan Gevaryahu),
+fetched from `github.com/mamedev/mame/blob/master/src/mame/dec/dectalk.cpp`.
+Local copy: `research/mame_dectalk.cpp`.
+
+- **Main CPU**: Motorola 68000, `XTAL(20MHz)/2` = 10MHz. Runs the closed
+  firmware: sentence parsing, letter-to-sound, prosody, DUART/host I/O,
+  NVRAM, LEDs. Emulate with **Unicorn Engine's M68K backend**.
+- **DSP**: TI TMS32010, `XTAL(20MHz)` = 20MHz. Runs the Klatt synthesis
+  math and produces 10kHz 12-bit samples. **Unicorn has no TMS32010
+  backend** — this needs a standalone core (small ISA, ~40 instructions,
+  single accumulator + T/P registers, 144 words on-chip data RAM, 2K words
+  program space). Port logic from MAME's BSD-3 `cpu/tms320c1x/` device or
+  write from the public TI datasheet.
+- **DUART**: Signetics/Philips SCN2681 (a.k.a. MC68681-compatible),
+  `XTAL(3.6864MHz)`. Channel B is the host RS-232 port (this is the one we
+  care about — the driver wires `b_tx_cb` to the `rs232` slot device, i.e.
+  outbound bytes from channel B are what the host sees). Channel A
+  (`duart_txa`) is an unused secondary passthrough in the MAME driver —
+  ignore it. DUART IRQ → 68K IRQ level 6.
+- **NVRAM**: Xicor X2212, holds saved voice/setup state across power
+  cycles. Not critical for v1 — can start from the ROM-embedded default
+  NVRAM image and skip persistence.
+- **DAC**: AD7541, 12-bit, driven by a **fixed 10kHz** sample-output timer
+  (`outfifo_read_cb`, `attotime::from_hz(10000)`). This is a hard ceiling
+  on output audio bandwidth/fidelity to reproduce, and it's also why
+  end-to-end latency can be very low — samples are produced and consumed
+  in small 100µs steps, not big blocks.
+- Interrupt map: TLC (telephone/DTMF) = IRQ4, SPC (speech/DSP) = IRQ5,
+  DUART = IRQ6. We don't need the telephone/DTMF (TLC) hardware for a
+  screen-reader use case — stub it to always-idle/no tone/no ring.
+
+## 2. ROM layout (verified SHA1, v2.0 firmware — first-half tag 23Jul84,
+   second-half tag 02Jul84 — plus the "clean" DSP `204/205` pair which the
+   driver's own comments say doesn't clip, unlike `165/166` or `409/410`)
+
+Main CPU ROM region is `ROM_REGION16_BE(0x40000, "maincpu")`: 16 chips of
+0x4000 bytes each, **byte-interleaved** (`ROM_SKIP(1)`) into a linear
+0x40000-byte big-endian word image. Load order/offsets (offset → chip →
+verified SHA1):
+
+```
+0x00000 e8   e586de03e113683c2534fca1f3f40ba391193044
+0x00001 e22  7954bb56b7591f8954403a22d34de31c7d5441ac
+0x08000 e7   7724babf4ae5d77c0b4200f608d599058d04b25c
+0x08001 e21  af5e4ea0b3631f7d6f16c22e86a33fa2cb520ee0
+0x10000 e6   1b60cd71dfa83408b17e13f683b6bf3198c905cc
+0x10001 e20  4ad0b00628a90085cd7c78a354256c39fd14db6c
+0x18000 e5   e2b2415eec838ddd46094f2fea93fd289dd0caa2
+0x18001 e19  92ab22a24484ad0d0f5c8a07347105509999f3ee
+0x20000 e4   b5aec0bf37a176ff4d66d6a10357715957662ebd
+0x20001 e18  891f3a3b4ce75ef14001257bc8f1f60463a9a7cb
+0x28000 e3   4d6808f67cbdd316df23adc8ddf701df57aa854a
+0x28001 e17  496c69e52cfa013173f7b9c500ce544a03ad01f7
+0x30000 e2   de0c25687bab3ff0c88c98622092e0b58331aa16
+0x30001 e16  c450abae0ccf372d7eb87370b8a8c97a45e164d3
+0x38000 e1   355348bfc96a04193136cdde3418366e6476c3ca
+0x38001 e15  01921e77b46c2d4845023605239c45ffa4a35872
+```
+
+Each pair loads at `offset` and `offset+1` with `ROM_SKIP(1)`, i.e. chip A
+supplies even bytes, chip B supplies odd bytes, of each 0x8000-byte block.
+
+DSP ROM region `ROM_REGION(0x2000, "dsp")`, two 0x800-byte chips,
+byte-interleaved into a 0x800-word (2048 word) TMS32010 program image:
+
+```
+word offset 0x000 (even bytes) e70  3136bae243ef48721e21c66fde70dab5fc3c21d0  (23-205f4)
+word offset 0x001 (odd bytes)  e69  9409f90f7a397b041e4440341f2d7934cb479285  (23-204f4)
+```
+
+All of the above were confirmed byte-for-byte against the user's dump on
+2026-07-28 (`sha1sum` on `roms_extracted/*`).
+
+## 3. 68000 memory map
+
+Verbatim from the driver's own comment block (address lines a23..a1,
+UDS/LDS via a0). Key regions:
+
+| Range (before mirror) | Access | Function |
+|---|---|---|
+| `0x000000–0x03ffff` | R | ROM (mirrored across `0x740000`) |
+| `0x080000–0x093fff` | RW | RAM (mirrored across `0x760000`) |
+| `0x094000–0x0943ff` (umask 0x00ff) | W | Status LED byte |
+| `0x094000–0x0941ff` (umask 0xff00) | RW | X2212 NVRAM direct read/write |
+| `0x094200–0x0943ff` (umask 0xff00) | RW | NVRAM recall (R) / store (W) trigger |
+| `0x098000–0x09801f` (umask 0x00ff) | RW | SCN2681 DUART (a0 not connected) |
+| `0x09c000–0x09c001` | RW | SPC flags reg: d7 infifo-semaphore(R), d6 spc-irq-enable(RW), d5 fifo-error(R), d1 clear-error/semaphore(W), d0 speech-init/reset(RW) |
+| `0x09c002–0x09c003` | W | SPC infifo write (clocks the 32-word input FIFO to the DSP) |
+| `0x09c004–0x09c005` | RW | TLC flags (telephone/DTMF — stub, not needed) |
+| `0x09c006–0x09c007` | R | TLC DTMF read (stub, not needed) |
+
+## 4. TMS32010 side
+
+- Program map: `0x000–0x7ff` = ROM (2048 words, matches the interleaved
+  DSP image above).
+- IO map: port 0 write = `spc_latch_outfifo_error_stats` (sets the
+  infifo-semaphore true, latches a soft-error bit from data&1). Port 1
+  read = pull next word from the 32-word infifo (`spc_infifo_data_r`);
+  port 1 write = push a sample word into the 16-word outfifo
+  (`spc_outfifo_data_w`, also clears DSP INT momentarily). `BIO` pin reads
+  the infifo-semaphore (`spc_semaphore_r`) — DSP polls this to know if
+  input is available.
+- DSP `INT` (input line 0) is asserted whenever outfifo has room
+  (`count < 16`) so the DSP knows it can push more samples; cleared when
+  full or immediately after a port-1 write.
+- 68K→DSP reset: SPC flags bit 0 (speech-init) drives the DSP's
+  `INPUT_LINE_RESET` directly — set it to hold DSP in reset & clear both
+  FIFOs; clear it to run.
+
+## 5. Output audio pipeline
+
+`outfifo_read_cb` fires at a fixed 10kHz, every tick pops one word off the
+16-word outfifo (repeats last value if empty — this is what real hardware
+does, not a bug to "fix"), transforms it `((data & 0xfff0) ^ 0x8000)`
+(top bit inverted, bottom 4 bits dropped — 12-bit signed-ish DAC word),
+and writes it to the AD7541. **Our emulator harness owns this timer loop**
+and is the single source of truth for "what has been spoken so far" —
+this is what makes sample-accurate synthetic indexing possible (§7).
+
+## 6. DECtalk v2.0 in-line command language (verified from the actual 1984
+   DTC-01 Owner's Manual, `EK-DTC01-OM-002`, 2nd ed. May 1984 — NOT the
+   later "DECtalk Software" SDK docs at dectalk.github.io, which describe
+   a different, later product generation with a superset command set that
+   does not fully apply to this ROM)
+
+- **Rate**: `[:ra n]`, n = 120–350 words/minute, default 180. (Later
+  DECtalk Software calls this `[:rate]` — this hardware uses `[:ra]`.)
+- **Pause**: `[:cp n]` comma pause, `[:pp n]` period pause (both affect
+  effective WPM).
+- **Punctuation / voice select / etc.**: built-in canned voices are
+  selected with short mnemonic commands (`:np` Paul, `:nb` Betty, `:nh`
+  Harry, `:nf` Frank, `:nr` Rita, `:nu` Ursula, `:nw` Wendy, `:nk` Kit,
+  `:nv` the user-modifiable "Val" slot) — confirm exact set against
+  Table 5-2 "New Voice Commands" before finalizing the NVDA voice list
+  (not yet fully extracted — **follow-up needed**).
+- **NO `[:index mark]` command exists in this firmware.** Confirmed by
+  full-text search of the OCR'd manual — zero hits for "index mark" /
+  "Index Mark" as a command. This is a later DECtalk Software addition.
+  See §7 for how NVDA indexing is achieved anyway.
+- **`[:dv ...]` Design Voice parameters** — Table 5-3, verified verbatim
+  from the manual (OCR'd table was column-scrambled; reconstructed by
+  matching the alphabetical abbreviation list against the matching
+  alphabetical description list, both of which independently line up
+  1:1):
+
+| Abbr | Meaning | Min | Max | Unit |
+|---|---|---|---|---|
+| `ap` | Average pitch | 50 | 300+ | Hz |
+| `as` | Assertiveness | 0 | 100 | % |
+| `b4` | 4th formant bandwidth | 100 | 2048 | Hz |
+| `b5` | 5th formant bandwidth | 100 | 2048 | Hz |
+| `bf` | Beginning pitch baseline fall | 50 | 200 | Hz |
+| `br` | Breathiness | 0 | 60 | dB |
+| `ef` | End pitch baseline fall | 50 | 200 | Hz (OCR showed "dB"; almost certainly Hz to match `bf` — verify against ROM disassembly or real unit before shipping) |
+| `f4` | 4th formant frequency | 2500 | `f5`-250 | Hz |
+| `f5` | 5th formant frequency | coupled to `f4` (`f4`+250 .. ~4900) | | Hz — OCR-ambiguous, treat as coupled range, re-derive precisely later |
+| `fo` | Forte voice | 0 | 100 | % |
+| `ft` | F0-dependent spectral tilt | 0 | 100 | % |
+| `g1`–`g5` | Synthesizer gain 1–5 | 0 | 80 | dB |
+| `gf` | Gain of frication source | 0 | 80 | dB |
+| `gh` | Gain of aspiration source | 0 | 80 | dB |
+| `gn` | Gain of nasal resonator | 0 | 80 | dB |
+| `gv` | Gain of voicing source | 0 | 80 | dB |
+| `hs` | Head size | 75 | 150 | % |
+| `la` | Laryngealization | 0 | 100 | % |
+| `nf` | Samples in glottal pulse open phase | 0 | 60 | (int) |
+| `p4` | Parallel formant 4 frequency | — | — | tied to `f4` |
+| `p5` | Parallel formant 5 frequency | — | — | tied to `f5` |
+| `pr` | Pitch range | 0 | 250 | % |
+| `ri` | Richness | 0 | 100 | % |
+| `sex` | 0=female / 1=male (also accepts `f`/`m`) | | | |
+| `sm` | Smoothness (high-freq attenuation) | 0 | 24 | dB |
+
+  Plus `list`, `listall`, `save` (actions, not values).
+
+- **No native "hat rise" / "stress rise" / "quickness" / "lax
+  breathiness" parameters exist on this firmware.** These are terms from
+  later DECtalk Software (the user's original request used that later
+  vocabulary). Map user-facing NVDA settings honestly:
+  - "Head Size" → `hs` (real, direct match)
+  - "Breathiness" → `br` (real, direct match)
+  - "Laryngealization" → `la` (real, direct match) — do **not** invent a
+    separate "lax breathiness" setting; it doesn't exist here.
+  - "Baseline pitch contour" (bf/ef) is the real analog closest to what
+    later docs call "hat rise" — expose as two settings (`bf`, `ef`) with
+    honest labels, not a fabricated "hat rise" name.
+  - "Assertiveness" (`as`) is the closest real analog to "stress rise" —
+    expose it under its real name.
+  - Do not expose settings the firmware doesn't have.
+
+## 7. Synthetic indexing design (user-approved 2026-07-28)
+
+Because the firmware has no index-mark concept, NVDA index tracking is
+built entirely in our own driver/emulator layer, not derived from
+anything the DTC-01 sends back:
+
+1. Split each NVDA speech sequence into chunks at every `IndexCommand`.
+2. Feed chunk N's text into the emulated infifo as normal.
+3. Because our harness runs the *exact* cycle-stepped simulation (§5),
+   it has ground truth for "has the firmware fully drained everything
+   related to chunk N" — poll internal state (infifo empty AND outfifo
+   empty AND held stable for a short debounce window) rather than
+   inspecting the audio stream.
+4. Only once that idle state is confirmed, fire the NVDA index callback
+   for chunk N's IndexCommand and release chunk N+1 into the infifo.
+5. Trade-off accepted by the user: a small, tunable silence gap at each
+   index boundary (target: imperceptible, likely masked by DECtalk's own
+   natural clause-boundary pausing) in exchange for guaranteed-correct
+   index positions instead of timing-estimated ones.
+
+## 6b. Built-in voice table (Table 5-2, verified from the manual)
+
+Seven built-in voices plus one user-definable slot, selected with `[:n_]`:
+
+| Command | Name | Characteristics |
+|---|---|---|
+| `:np` | Perfect Paul | standard male |
+| `:nb` | Beautiful Betty | standard female |
+| `:nh` | Huge Harry | deep male |
+| `:nf` | Frail Frank | older male |
+| `:nk` | Kit the Kid | child's voice (10yo) |
+| `:nr` | Rough Rita | deep female |
+| `:nu` | Uppity Ursula | light female |
+| `:nv` | Variable Val | user-definable (holds whatever `[:dv ... save]` last stored) |
+
+A voice change needs a brief silence around it (the manual recommends
+putting a clause boundary/comma before or after a mid-utterance `[:n_]`).
+
+## 9. Session 1 status (2026-07-28/29) — read this first when resuming
+
+**Architecture pivot:** Unicorn's M68K backend was abandoned (documented gap,
+unicorn-engine/unicorn#1502, can't auto-vector internally-generated CPU
+exceptions like privilege violation/address error, which the DTC-01's
+mandatory boot self-test relies on) and `machine68k` (direct Musashi
+binding) was abandoned too (broken Windows build script, no prebuilt
+wheels). The M68000 core is now fully hand-written:
+`emu/m68000.py` (registers/memory/exceptions) + `emu/m68000_ops.py`
+(instruction set). **This is validated against Musashi's authoritative
+opcode table (research/musashi_m68k_in.c, MIT-licensed) via
+`tools/verify_opcodes.py`: 0 missing opcodes, 0 extraneous opcodes, across
+all 65536 possible values.** Every bug that check caught (CLR/NEG swapped,
+EXT size-bit position, CHK missing Dn-direct/immediate forms, MOVEM
+predecrement/postincrement backwards, ABCD wrong opmode, several
+byte-size-to-An-register and control-addressing-mode over-permissions) is
+fixed. Re-run this checker after touching any instruction-table code.
+
+**Current working state:** boots the real ROM cleanly with **no patches or
+bypasses** (the old `SELF_TEST_SKIP_PC` hack was needed only for Unicorn
+and is gone). Confirmed working: full self-test pass, DUART host-channel
+handshake (CTS/DSR spoof + the documented IP4-second-read hack), default
+NVRAM image loaded from ROM_FILL data, text sent over the DUART host
+channel (`machine.duart.feed_rx_b(...)`) is correctly received byte-by-byte
+via RHRB (confirmed by watching `duart.b.rx_queue` drain to empty).
+
+**Where it's stuck:** received host text never reaches the SPC/DSP input
+FIFO (`machine.infifo_count` stays 0, `m68k_infifo_w` is never called), so
+no synthesis happens. `tools/disasm68k.py` (a minimal disassembler built
+this session, mnemonic ID cross-checked against the same Musashi table)
+shows the firmware settles into `0x10D8: BRA $0010D8` with interrupts fully
+enabled (SR=0) after boot -- this looks like a legitimate idle loop (the
+firmware appears to implement lightweight cooperative multitasking using
+RTE as a generic "restore saved SR/PC and jump" context-switch primitive,
+not a crash), waiting for an interrupt to hand control to a runnable task.
+DUART RX-ready interrupts clearly *are* being serviced (that's how bytes
+get drained from `rx_queue`), so a receive handler runs -- it just isn't
+handing characters on to speech processing. Two rejected/inconclusive
+hypotheses this session: (1) a fake phone-ring stimulus *did* move execution
+into new code (0x213E-0x21B8, a TLC/telephone state machine keyed off a
+struct at `$80552`) but led back into the same idle loop -- likely an
+unrelated parallel subsystem, not the real blocker; (2) faking
+tone-detect made no observable difference at all.
+
+**Next steps to try when resuming:**
+- Use `tools/disasm68k.py` to read the DUART RX-ready interrupt handler
+  itself (find its vector -- IRQ6 handler address at ROM offset 0x78 --
+  and disassemble forward from there) to see what it does with each
+  received character and what condition it's waiting for before handing
+  off to the SPC (likely: waiting for a specific terminator, a line-buffer
+  full condition, or a "we're in on-line/host-speak mode" flag this
+  session never confirmed is actually set).
+- Check whether our default NVRAM image (section 2's factory-default
+  bytes) actually encodes "HOST SPEAK: on" per the manual's stated
+  default, or whether it's misconfigured -- the driver author himself
+  never fully validated this image ("calculated some weird way which I
+  haven't figured out yet"). Correlate NVRAM byte offsets against the
+  manual's Table 3-2 SET command parameters (host format/speed/speak,
+  local host/speak/edited, etc.) if a mapping can be derived.
+- Consider dumping/disassembling the dispatch table at ROM `$2666` (3
+  entries, functions at 0x1184/0x15D8/0x22AA) more fully -- entry 0
+  (0x1184) is the self-test-adjacent code already explored; 0x15D8 and
+  0x22AA (the TLC/ring code from hypothesis 1) haven't been read in detail.
+
+**Tooling added this session** (all in `tools/`, dev-only, not shipped):
+`build_rom_images.py`, `smoke_test_dsp.py`, `boot_test.py`, `diag_step.py`,
+`speak_test.py`, `wav_writer.py`, `verify_opcodes.py`, `disasm68k.py`.
+`research/` holds the downloaded MAME driver source, Musashi opcode table,
+and the OCR'd DTC-01 Owner's Manual -- all reference material, not shipped.
+
+## 10. Session 2 status (2026-07-30) — read this first when resuming
+
+Picked up exactly where session 1 left off (§9's "next steps"): disassembled
+the level-6 (DUART) interrupt handler and traced the full path a received
+host-channel character takes, using `tools/disasm68k.py` for static reading
+and two new live-instrumentation scripts (`tools/trace_spc_queue.py`,
+`tools/trace_task_wait.py`) that monkeypatch `SystemBus.write8/16/32` to log
+writes to specific regions with the executing PC, run against the real ROMs
+via `DectalkMachine` directly (not through `emu.uc`/Unicorn — those are gone
+per §9's architecture pivot; `tools/boot_test.py` and `tools/diag_step.py`
+are now **stale/pre-pivot** and reference a `m.uc` attribute that no longer
+exists — don't trust them without updating first, use `tools/speak_test.py`
+as the current reference for how to drive `DectalkMachine`).
+
+**Confirmed call chain, RX side:**
+- Level-6 vector = `0x1706` → saves regs, calls a RAM function-pointer at
+  `$080532` (set up at boot, presumably normally = the dispatcher below),
+  then `JMP $1132` (continuation).
+- The DUART ISR-bit dispatcher lives at `0x1718`: reads ISR (`$09800B`),
+  loops handling each set bit, re-reading ISR each pass, until 0. Bit
+  layout confirmed against source: bit0/4 = TxRDY A/B → `0x1800`; bit1/5 =
+  RxRDY A/B → `0x1878`; bit3 = counter/timer tick → `0x0B7A`; bit2/6 =
+  delta-break A/B → sets a status byte; final unconditional tail (`0x17C2`)
+  recomputes and writes the LED byte (`$094001`) from IMR + a state var at
+  `$080536`, optionally calling a hook at `$08053A` if `$080538` is set.
+- Channel B (host, our channel) RX → `0x1878` with `A1 = $080328` (the
+  channel-B "line" struct). This routine does XON/XOFF handling (checks
+  D0==0x11/0x13, sets a pause flag at offset 65) then, for a normal data
+  byte, falls to `0x1954` → `JSR $000CFE` with `D0`=the received byte,
+  `A2`=a queue-descriptor pointer (not literally `$080328`; comes from
+  `70(A1)` deref, i.e. indirection through the line struct — see below).
+- **`0x0CFE` is a generic OS primitive** (receive-a-char-into-a-queue /
+  wake-a-waiter), reused by other drivers too — not host-channel-specific.
+  Logic: if `16(A2)` (offset 0x10, "task waiting on this queue" pointer)
+  is nonzero, it hands the char directly to that task and wakes it by
+  inserting it into the OS ready-queue at `$080000` via the generic
+  sorted-list-insert helper at `0x2334`. If `16(A2)` is zero, it instead
+  calls a buffering path at `0x0FFE` (not yet disassembled) via
+  `12(A2)` — i.e. just stores the byte, no task involved.
+- **Live-traced with `tools/trace_task_wait.py`**: `$080328+0x10` (the
+  waiting-task pointer for channel B's queue) reads **`0x00000000` both
+  before and after** feeding `"[:np] Hello world.\r"` and running 2
+  virtual seconds. **No task is ever registered as waiting on host-channel
+  input.** Every received byte therefore takes the silent-buffer branch
+  (`0x0FFE`), and nothing ever drains that buffer.
+
+**Confirmed call chain, SPC (speech) send side** (the other end of the
+pipe, independently traced from the MMIO addresses in DESIGN.md §3):
+- Static search of every absolute reference to `$09C000`/`$09C002`
+  (spc-flags / infifo-write MMIO) in the ROM found them **all** clustered
+  in one module, `0x13C00`–`0x13F98`. This is the actual "feed the SPC"
+  code: `0x13CC8` bursts 24 words at a time into `$09C002` (infifo write);
+  `0x13D1E` does the DSP reset/handshake sequence (write speech-init,
+  clear it, poll bit 0x80 = infifo-semaphore for DSP-ready).
+- Level-5 (SPC) interrupt vector = `0x231C` (matches `IRQ_SPC` in
+  `machine.py`) → its entire body is: push a queue-descriptor pointer
+  (`$08273C`), `JSR $13C7C`, `RTE`. So **every** SPC interrupt just asks
+  "is there a queued utterance buffer ready to send?".
+- `0x13C7C`/`0x13D48` implement a classic linked-list send-queue: head
+  `$08272A`, tail `$08272E`, descriptor base `$082726` (offsets +4/+8).
+  Dequeues one node (`A3`), sends its buffer via `0x13CC8`, on empty
+  clears `$09C000` and returns. **Static search found zero references to
+  `$08272A`/`$08272E`/`$082726` anywhere in the ROM outside this one
+  module** — meaning the *producer* (whatever is supposed to enqueue a
+  synthesized utterance here) either doesn't exist in this firmware image
+  in the form expected, or reaches this queue through a pointer passed in
+  a register rather than a literal address (not yet located).
+- **Live-traced with `tools/trace_spc_queue.py`**: watched all writes to
+  `$082700`–`$082780` (the whole queue-descriptor region) and to
+  `$09C000`–`$09C007` (SPC MMIO) for the entire run. Only 84 writes total,
+  **all during the 0.3s boot settle** (a zero-init loop at `PC=0x001046`
+  and a ROM→RAM init-table copy at `PC=0x001076`) — literally **zero
+  writes of any kind after the text is fed**, confirming synthesis is
+  never even attempted, consistent with (and now more precisely located
+  than) §9's original "`m68k_infifo_w` is never called" observation.
+
+**Conclusion — the real blocker is upstream of both ends**: nothing ever
+creates/starts the host-channel-input-processing task (the piece that
+would (a) register itself as the waiter on `$080328`'s queue so `0x0CFE`
+wakes it per-character instead of silently buffering, and (b) turn
+buffered text into phonemes and enqueue a buffer at `$08272A`/`$08272E`
+for the SPC ISR to send). This is consistent with §9's `BRA $0010D8` idle
+loop finding — there's simply no runnable "host speak" task in this
+firmware image as currently booted.
+
+**NVRAM investigated and ruled out as a simple "wrong default bit" bug**
+(the hypothesis this session set out to test first): MAME's driver source
+comments (`research/mame_dectalk.cpp` lines 129-136, 960-977) document that
+the real factory-default NVRAM image is embedded in the ROM at main-CPU
+address `0x1A7AE` (0x80 bytes), decoded by taking, for each of the 64
+16-bit ROM words there, all four nibbles in turn as four successive NVRAM
+bytes (`word 0x0005` → nvram bytes `05 00 00 00`). **Independently decoded
+this directly from our own dumped ROM** (not just trusting MAME's comment)
+and it reproduces `machine.py`'s `_DEFAULT_NVRAM` array byte-for-byte at
+every populated offset — so our default image is a faithful copy of the
+real one, not a guess. Also found and disassembled the actual NVRAM-recall
++ checksum-validate routine (`0x10F52`, matches MAME's noted "`$10f52`
+entry point for nvram check routine"): it reads all 256 NVRAM MMIO nibble
+bytes (`$094000`-`$0941FF`), repacks them into a 64-word block, runs an
+XOR/rotate checksum over words 0-62 against the stored checksum in word 63
+(byte offset 0xFC, matches §2/§9's already-known checksum bytes), and
+separately requires word 0 == 5 (a validity magic number — also matches:
+our default's offset-0 nibble is 5). All consistent and passing, which
+also matches Session 1's observation of a clean self-test with no NVR
+FAULT LED code. **Conclusion: the recalled NVRAM block is valid and
+correctly loaded — this is not a checksum/corruption bug.** What remains
+unknown is the *semantic* mapping of each of the 12 populated nibble
+fields (offsets 0,4,8,0xC,...,0x2C) to named Table 3-2 SET parameters
+(HOST FORMAT/SPEED/SPEAK, LOCAL HOST/SPEAK/EDITED/HARDCOPY/SPOKENSETUP,
+LOCAL SPEED/FORMAT, MODE flags, LOG flags) — the manual doesn't document
+byte layout, so this can only come from disassembling how the recalled
+64-word block (copied further into a per-field structure around
+`0x8279C`-`0x827B8`+ during boot, seen starting at `0x1108C`) is consumed.
+
+**New, stronger finding this session — likely the real root cause
+location**: reused `tools/trace_task_wait.py`'s existing log of every
+write to the OS ready-queue anchor (`$080000`-`$08000C`) during the 0.3s
+boot settle. Only **one single task TCB address, `$008297C`, is ever
+inserted** into the ready queue — 4 total writes, all cycling the same
+address (queue-anchor self-init at `0x10A8-0x10B4`, then that one TCB
+inserted/manipulated at `0x11C6`/`0x2370`/`0x1166`/`0x239A`). **No second
+task is ever created or scheduled during boot.** This is consistent with
+(and narrows down) §9's `BRA $0010D8` idle-loop finding: there is
+apparently exactly one runnable task in the whole running system — almost
+certainly the idle task itself — and no "host speak" input-processing task
+ever exists to begin with. This reframes the problem: it may not be that
+an existing host-task fails to register as a waiter (as previously
+theorized) so much as that **the host-task is never spawned in the first
+place**, in which case the fix isn't a config-bit flip but finding why
+task creation for it doesn't happen (or doesn't happen in our emulated
+environment specifically — e.g. gated on a hardware signal we're not
+asserting, not just an NVRAM value).
+
+**Next steps to try when resuming:**
+- Find the task-*creation* OS primitive (allocates a TCB, sets its entry
+  PC — distinct from `0x2334`'s ready-queue insert, which only reschedules
+  an *existing* TCB) and enumerate every call to it during the boot
+  sequence (same live-trace-with-PC-logging technique as
+  `trace_spc_queue.py`/`trace_task_wait.py`) to get a definitive list of
+  which tasks this firmware actually spawns in our emulated environment.
+  If a host-task creation call exists but is skipped, find its guard
+  condition next (may still turn out to be an NVRAM/config check, just at
+  creation time rather than at wakeup time as first assumed).
+- If no host-task creation call exists in the boot path at all, work
+  backward from TCB `$8297C` (the one task that *is* created — dump its
+  entry point / stack setup to confirm it's really the idle task) to find
+  the boot-time task-spawn table/loop it came from, and see what other
+  entries that table has that we're not reaching (could be gated by a
+  hardware strap/DIP-switch condition our emulation isn't asserting,
+  distinct from the NVRAM values already ruled out above).
+- Still-open from earlier: disassemble `0x0FFE` (the silent-buffer path in
+  the generic char-receive primitive) and `0x1132` (continuation after the
+  level-6 handler's `$080532` function-pointer call) — unread, could
+  contain relevant logic. Also still unconfirmed: what `$080532` actually
+  points to at runtime (assumed `0x1718` from context, never live-checked).
+
+**UPDATE, same session, root cause found and confirmed**: traced the boot
+sequence exhaustively rather than guessing at NVRAM semantics further.
+`0x102C` is the actual post-self-test boot continuation (documented by
+MAME's driver comment as the self-test-skip target): it sets up a heap
+allocator at `$082978`, statically creates exactly one task (the idle
+task, entry point `0x000010D8` — now 100% confirmed, not just inferred)
+at fixed address `$080018`, then walks a **3-entry ROM table at
+`0x2666`-`0x2696`** calling each entry's init function. All 3 entries are
+now identified: `0x1184` (self-test-adjacent, per §9), `0x22AA` (TLC/
+telephone subsystem, per this session's earlier TLC init trace), and
+`0x15D8` (newly read this session) — **there is no 4th subsystem-init
+call anywhere in the boot path**, so nothing else is "supposed" to run at
+boot beyond these three.
+
+`0x15D8` programs the SCN2681 DUART hardware directly (baud/mode/command
+registers for both channels), sets up the channel-A/B line-discipline
+structs (confirms `$080532 = 0x1718`, matching what we already verified
+live), and calls `JSR $1B8E`. **`0x1B8E` is the connection state
+machine's boot-time init**: it puts the system into "state 5, first
+500ms" (LED byte written once: `0xDA` — matches the LED value observed
+unchanged for the *entire* run, confirming this is a one-time write, not
+a live/current status as originally assumed) and explicitly **clears**
+`$080538`/`$08053A` (the hook-enable flag and hook pointer). The function
+that *would* advance past this state — `0x1BF4` (reads CTS/DSR/DCD via
+the DUART's IP register, transitions state, and **does** arm
+`$080538=1` + a real `$08053A` handler address) — is never called by
+anything in the boot path. It's designed to be invoked via a **software
+delayed-callback timer list** (walked by `0x0B7A`, dispatched from DUART
+ISR bit 3 "counter ready", head pointer at `$080118`) — i.e. the
+intended mechanism is "arm a ~500ms hardware timer, and when it fires,
+call `0x1BF4` to check the modem lines and progress the state machine."
+
+**Confirmed empirically**: `$080118` (the timer list head) is `0x00000000`
+(no timer ever armed) and, more tellingly, `$08010E` (a global tick
+counter incremented once per DUART counter-interrupt service in `0x0B7A`)
+stays **exactly `0x00000000` after 7+ virtual seconds** of run time
+across two text feeds. **The DUART's counter/timer interrupt has never
+fired once.** This fully explains every symptom traced this session: no
+second task, empty SPC queue, null `$08053A` hook, frozen LED — the
+firmware is stuck at the very first checkpoint of its boot sequence,
+waiting on a timer interrupt our emulation never generates.
+
+**Root cause, confirmed by reading the emulation code directly**:
+`emu/duart2681.py`'s `SCN2681` class has **no counter/timer emulation at
+all**. `_isr()` (lines 206-216) computes only TXRDYA/RXRDYA/TXRDYB/RXRDYB
+— there's no "counter ready" bit (real SCN2681 ISR bit 3, `0x08`). The
+CTU/CTLR count-value registers (offsets `0x0C`/`0x0E`) aren't stored
+anywhere (`write()` has no case for them — silently dropped). Offsets
+`0x1C`/`0x1E` are implemented only for their *write*-side meaning
+(Output-Port set/reset, per the file's own docstring) — the real SCN2681
+also defines a *read*-side meaning for those same addresses
+(start-counter / stop-counter commands), which `read()` doesn't
+implement at all (falls through to `return 0`). There is no periodic
+countdown/tick mechanism anywhere in the class.
+
+**This is the actual, scoped bug**, not a config/NVRAM issue as
+originally suspected (NVRAM was independently verified correct earlier
+this session — see above). Fix sketch, not yet implemented (pending
+user go-ahead): store CTU/CTLR on write; implement start/stop-counter
+semantics on read of `0x1C`/`0x1E` (arm/disarm an internal countdown);
+add a step function called from `machine.py`'s existing virtual-time
+loop (same place DSP cycles and DAC sampling are already stepped) that
+decrements the countdown using the DUART crystal's documented rate
+(`3.6864MHz`, DESIGN.md §1 — real SCN2681 counter mode typically clocks
+at crystal÷16; verify against ACR clock-source-select bits the firmware
+actually programs rather than assuming); on expiry, set ISR bit `0x08`
+and run it through the existing `_update_irq()`/IMR gating, which is
+already correctly wired to `IRQ_DUART`. **This one fix is expected to
+unblock the entire pipeline** traced this session (state machine
+progression → `$08053A` hook → whatever ultimately creates the
+host-speak task/enqueues SPC buffers), though that downstream chain
+past `0x1BF4` hasn't been traced yet and should be re-verified once the
+timer fix lands (things could still be stuck one step further in — this
+should be treated as "removes the currently-known blocker," not
+"guaranteed to produce audio" until re-tested).
+
+## 11. Session 2 continued — DUART counter/timer implemented, SPEECH WORKS
+
+**Implemented the fix described above** in `emu/duart2681.py`: added
+`ctur`/`ctlr` register storage (writes to offsets `0x0C`/`0x0E`), a
+`start_counter()`/`stop_counter()` pair wired to reads of offsets
+`0x1C`/`0x1E` (previously unhandled), a `step(dt_seconds)` method that
+converts elapsed wall-clock-equivalent time to clock ticks using
+`ACR`'s mode/clock-source-select bits (crystal ÷16 or ÷1 for the
+crystal-derived modes this firmware actually uses; IP2/TxC-derived modes
+are left at 0 Hz since nothing models those external clock sources), and
+an `ISR_COUNTER_READY` (`0x08`) bit wired into the existing `_isr()`/
+`_update_irq()`/IMR gating. `machine.py`'s `run_seconds()` now calls
+`self.duart.step(elapsed)` once per 68000 instruction, alongside the
+existing DSP-cycle and DAC-sample stepping.
+
+**One correction made during implementation, found empirically**: the
+first version (stop-counter unconditionally halts counting, matching a
+literal one-shot "Counter mode" reading of the datasheet) produced
+exactly **one** tick ever, then silence — confirmed by live-tracing every
+DUART register access with the executing PC: the firmware's own boot
+init (`0x15D8`, tail instruction `TST.B 29(A0)` at ROM offset `0x1700`,
+executing with `A0` still `= $098000`) issues exactly one Start-Counter
+command, and its ISR bit-3 handler (`0x1750`, `TST.B $0009801F`) issues a
+Stop-Counter read **unconditionally on every tick as its interrupt-ack**,
+with no re-arm call anywhere else in the ROM (confirmed by scanning ALL
+DUART register reads over a 5-virtual-second run — exactly one start,
+one stop, nothing else). Since real firmware obviously wouldn't design a
+system tick that kills itself on first use, this only makes sense if
+**Stop-Counter in Timer mode doesn't actually halt counting** (only
+Counter/one-shot mode truly stops; Timer mode's stop just acks/clears
+the interrupt and disables the OP3 output pin, per the standard SCN2681
+command semantics) — implemented that way in `stop_counter()`, and it
+immediately produced a steady ~100-190 tick/sec heartbeat matching the
+programmed `CTUR:CTLR=0x0480`/crystal-÷16 math.
+
+**Wrong turn, corrected**: with the heartbeat now running continuously,
+`$08010E` (global tick count) climbed steadily but `$080538`/`$08053A`
+(the FSM hook) stayed null for 10+ virtual seconds regardless — so the
+heartbeat alone wasn't sufficient, and chasing this further revealed a
+**misreading from earlier in this session**: `0x1BF4` (the CTS/DSR-check/
+state-advance function) has exactly one caller in the whole ROM, at
+`0x1B66`, inside a small per-channel dispatcher (`0x1B56`-`0x1B76`) that
+explicitly special-cases channel B: `CMPA.L #$00080328,A0; BEQ
+$001B74` — **if the channel is B (the host link), it branches straight
+to "return 0," skipping the FSM-advance call entirely.** The whole
+`0x1BF4`/`0x1B8E`/LED-state-machine/CTS-DSR/"moving data" apparatus is
+**channel-A-only** (the local/modem port) — consistent with DESIGN.md
+§1's original guidance that channel A is "an unused secondary passthrough
+... ignore it." This session's earlier framing of the LED byte as
+somehow gating host-channel readiness was a mistaken inference; it does
+not apply to channel B at all. (This dispatcher itself has no static
+callers found either — it's reached via a stored callback pointer, not
+worth chasing further now that it's understood to be irrelevant to the
+host path.)
+
+**Re-ran the earlier task/queue diagnostics after the fix, on channel B
+specifically, and the whole pipeline unblocked**: feeding text now
+causes `$080328+0x10` (channel B's "waiting task" pointer, stuck at
+`0x00000000` for the entire previous session) to become
+`0x0008297C` — a task is now genuinely blocking on host-channel input
+and getting woken per-character, exactly as the `0x0CFE` primitive was
+always designed to do. End-to-end (`tools/speak_test.py`, ROM booted,
+settled 0.5s, fed `"[:np] Hello world.\r"`, run 6s):
+- **Host TX now produces real bytes** (was always exactly 0 before):
+  `b'>[:np] Hello world.\r\n>'` — a clean local-echo-with-prompt,
+  exactly matching expected DEC terminal-driver behavior.
+- **Audio is no longer frozen**: samples were literally `-32768`
+  (silence baseline) for 100% of every prior run, forever. Now: silence
+  until t≈0.5s, then ~2.5s of densely-varying audio (t≈0.6-3.1s,
+  hundreds of unique sample values per 100ms block — consistent with
+  real formant synthesis, and a very plausible duration for "Hello
+  world." at the ~180 WPM default), a brief gap, a second ~0.9s burst
+  (t≈3.6-4.5s, plausibly the terminal echo line itself being spoken),
+  then silence again. This is a speech-shaped envelope, not noise or an
+  artifact.
+
+**Bottom line: this was the actual root-cause fix.** The DUART
+counter/timer was genuinely unimplemented (confirmed by reading the
+emulation code directly), the firmware's boot sequence and text-reception
+path were otherwise already completely correct (every piece traced this
+session — self-test, ROM/NVRAM, DUART wiring, RX line discipline, task
+wake primitive, SPC send-queue mechanics — turned out to be fine once
+the missing system tick was supplied). Not yet done: this hasn't been
+verified by ear (no audio playback available in this environment) or
+cross-checked against a spectrogram/known-good reference; the WAV at
+`build/speak_test.wav`/`speak_test2.wav` should be listened to before
+declaring this fully proven, and voice-command edge cases (other `[:n_]`
+voice selectors, `[:dv]` parameters, multi-utterance queuing, the
+still-undocumented Table 5-2 mnemonic set) remain open per §8 below.
+
+## 12. Session 2 continued — user listening test, audio DC-offset bug found and fixed
+
+**User confirmed by ear**: "definitely speech ... understandable," validating
+§11's fix end-to-end for the first time. But: "a click, some silence, then
+speech ... extremely, extremely loud ... about 30dB higher than it should
+be."
+
+**Root cause, found and fixed**: `tools/wav_writer.py`'s `on_sample()`
+stored the `on_audio_sample` callback's value as-is, on the mistaken
+assumption (stated in its own old docstring) that
+`machine.py`'s `_dsp_pop_outfifo` transform (`(data & 0xfff0) ^ 0x8000`,
+which is correct and should **not** change — it's the exact real-hardware
+AD7541 DAC input code, matching MAME) was already standard signed PCM.
+It isn't: that XOR converts the DSP's natural signed sample into
+*offset-binary* (what a real DAC chip needs — silence maps to mid-scale
+code `0x8000`, which is the DAC's 0V point). Storing `0x8000` directly
+and packing it as a 16-bit sample means it reads back as signed **-32768**
+— the extreme negative rail, not center. Voiced audio swinging up from a
+baseline pinned at the negative rail can wrap past `+32767` back around
+to strongly negative mid-utterance, producing exactly the harsh,
+clicky, over-loud distortion reported.
+
+**Fix**: XOR by `0x8000` a *second* time in `on_sample()` before storing,
+undoing the offset-binary conversion and recovering the DSP's natural
+signed sample (silence at `0`, correctly centered). Verified: stats went
+from `{min: -32768, max: -32768}` (frozen, pre-§11-fix) →
+`{min: -32768, max: 32752}` (post-§11-fix, but DC-shifted/wrapping,
+matching the "very loud" report) → `{min: -11792, max: 14608}` (after
+this fix — silence sample-blocks read exactly `0`, voiced blocks land at
+a sane ~±5000-12500 out of the full ±32768 range, no rail-pinning or
+wraparound). New reference file: `build/speak_test3.wav` (not yet
+re-confirmed by ear as of this writing — do that before considering this
+closed).
+
+**Important for future work**: this bug lives in the dev-only WAV
+exporter, not in `machine.py` (which stays hardware-accurate on purpose).
+**The eventual real NVDA-driver audio-output code will need this same
+"XOR 0x8000 again" correction wherever it turns `on_audio_sample` values
+into actual playback samples** — don't copy the old (buggy) assumption
+that the raw callback value is ready-to-play PCM.
+
+## 13. Session 3 (2026-07-30) — real-time performance investigation
+
+Before wiring the emulator into an actual NVDA `synthDrivers` package (the
+existing `addon/synthDrivers/dectalkDtc01/__init__.py` is still an empty
+stub), measured whether the pure-Python emulator can keep up with live
+audio playback. **It can't, by a wide margin**: baseline was
+**~0.138x real time** (speaking phase) / **~0.120x** (boot settle) --
+roughly an 8x slowdown, dominated by the TMS32010 DSP core (`cProfile`:
+~60-65% of total time in `tms32010.step()`/`run()`, vs. ~20% in the
+68000 core).
+
+User chose "try pure-Python optimization first" over going straight to a
+compiled extension. Applied, in order (correctness re-verified after
+each step via identical `speak_test.py` host-TX bytes + audio stats, and
+`tools/verify_opcodes.py` re-run clean at the end -- 0 missing/extraneous
+68000 opcodes):
+- `__slots__` on `TMS32010`, `Channel`, and `SCN2681` (removes
+  per-instance `__dict__` overhead on the hottest classes; skipped on
+  `M68000`/`M68000Core` -- it's built via multiple inheritance from
+  `M68000OpsMixin` + `M68000Core`, so `__slots__` there risks layout
+  conflicts for a smaller relative payoff, since the 68K core is a much
+  smaller share of total time than the DSP).
+- Hand-inlined `_ind()`/`_dma_dp()`/`_dma_dp1()`/`_update_ar()`/
+  `_update_arp()` directly into `_getdata`/`_putdata`/`_putdata_sar`/
+  `_putdata_sst` (by far the hottest TMS32010 methods) -- exact same
+  evaluation order preserved (address computed from pre-update AR,
+  AR/ARP updated after, `_putdata_sar`'s register read happens after the
+  AR update, matching the original). The non-inlined helpers are kept
+  for `_op_larp_mar`'s use.
+- Merged `TMS32010.run()` and `.step()`: `run()` (the actual hot path
+  called from `machine.py`) now has `step()`'s full body inlined into
+  its loop (with `program`/dispatch tables/`ADDR_MASK` hoisted to
+  locals) instead of calling `self.step()` per iteration.
+  `step()` itself is kept unchanged as the single source of truth
+  (still called directly by `tools/smoke_test_dsp.py`) -- **if
+  instruction dispatch/interrupt logic in `step()` ever changes, mirror
+  the change into `run()`'s inlined copy, and vice versa.**
+- Cached the DUART's `_counter_clock_hz()` result (depends only on
+  `acr`, which is essentially write-once at boot) instead of
+  recomputing it on every `duart.step()` call (called once per 68000
+  instruction).
+- `machine.py`'s `_pending_irq_level()`: was rebuilding a list and
+  calling `max()` from scratch on every single 68000 instruction;
+  replaced with an incrementally-maintained `self._pending_irq`,
+  updated only when `_set_irq()` actually changes a line (IRQ lines
+  change far less often than instructions execute).
+- `SystemBus.read8/write8/read16/write16`: fast-pathed the two
+  dominant regions (ROM, RAM) with a direct bounds check before falling
+  back to `_region()`'s full region-by-region dispatch for the less-hot
+  MMIO regions.
+- Inlined the trivial `_op_h` property (`(opcode>>8)&0xFF`, extremely
+  hot -- read by nearly every arithmetic/shift opcode) and the `s16()`
+  sign-extension helper at its two hottest call sites (`_getdata`'s
+  signext branch, `_op_mpy`).
+- `M68000.fetch16()`: inlined the trivial `_check_align` call.
+
+**Result: ~1.37x** (speaking phase: 0.138x → **0.189x** real time;
+boot settle: 0.120x → **0.163x**). Matches the "recommended" option's own
+stated expectation almost exactly ("realistic best case is maybe 2-4x...
+likely not enough alone") -- landed at the low end of that, and it is
+**not enough**: 0.189x is still roughly a 5.3x slowdown from real time,
+nowhere close to usable for a live NVDA synth driver. Diminishing
+returns had clearly set in by the last couple of changes (negligible
+measured delta). Going further with pure-Python micro-optimization
+is not expected to close a 5x+ gap.
+
+**Conclusion for next steps**: a compiled extension (Cython or a small C
+module) for the TMS32010 hot path -- and possibly the 68000 core too,
+though it's the smaller contributor -- is very likely necessary to reach
+real-time. This was flagged as the fallback option in the original
+choice between approaches; the pure-Python pass wasn't wasted work (it
+meaningfully shrinks what the compiled path needs to cover, and all the
+changes are behavior-preserving optimizations worth keeping regardless
+of what comes next), but it doesn't get to a usable place on its own.
+
+## 14. Session 3 continued — native C core: 0.189x → ~10x realtime
+
+Pure-Python optimisation (§13) topped out at 0.189x, still ~5x short of
+realtime, so the emulator was rebuilt as a native DLL. **Result: ~10x
+realtime, a 53x speedup over the optimised Python**, verified correct
+against the Python reference.
+
+### Architecture
+
+Everything runs in C; Python only pulls finished audio.
+
+- **68000: vendored Musashi 4.60** (`native/musashi/`, MIT). Not
+  hand-ported — it's the same lineage MAME's own dectalk driver uses, and
+  crucially it *does* auto-vector internally-generated exceptions
+  (address/bus error), the exact gap that killed Unicorn back in §9. Its
+  `m68k_in.c` is byte-identical (SHA1 `f8edf509…`) to the
+  `research/musashi_m68k_in.c` our Python core was validated against, so
+  both cores derive from the same opcode ground truth. See
+  `native/musashi/VENDORING.md` for config and a **critical build
+  gotcha** (m68kmake must be built `/Od`; `/O2` miscompiles it).
+- **TMS32010** (`native/tms32010.c`), **SCN2681** (`native/duart2681.c`),
+  **machine glue** (`native/dtc01.c`) — ported from the Python, quirks
+  intact, including the Timer-mode stop semantics from §11.
+- **Binding: ctypes to a flat C DLL**, not a CPython extension. NVDA
+  ships its own Python whose version moves independently of the dev
+  environment; a CPython-ABI extension would need rebuilding per version,
+  a plain DLL does not. The boundary is crossed once per audio chunk, so
+  ctypes' per-call overhead is irrelevant. Wrapper:
+  `addon/synthDrivers/dectalkDtc01/emu/native.py`.
+
+Why the *whole* machine and not just the DSP: profiling put the DSP at
+~65% of runtime, so by Amdahl even an infinitely fast DSP caps the gain
+at ~2.9x (→0.54x realtime). Porting only the hot part could not reach
+realtime; and a per-instruction Python↔C boundary would have cost more
+than it saved.
+
+### Two real bugs found during bring-up (both worth remembering)
+
+1. **`m68k_init()` was never called** — Musashi builds its opcode jump
+   table there; without it the first instruction jumps through a null
+   handler. Symptom: access violation on first execute.
+2. **Musashi auto-clears its own interrupt level.** With
+   `M68K_EMULATE_INT_ACK` off it does `CPU_INT_LEVEL = 0` the moment it
+   takes an interrupt (m68kcpu.h ~line 2157), expecting the board to
+   re-assert. Our IRQ lines are level-triggered, and `set_irq()`
+   originally notified Musashi only when the computed level *changed* —
+   so exactly one interrupt was ever delivered and the firmware's system
+   tick froze at 1. This reproduced §10's symptoms exactly (LED stuck at
+   `0xDA`, no speech), which is a good reminder that *identical symptoms
+   can have unrelated causes*. Fix: the run loop re-asserts
+   `pending_irq` every instruction.
+
+### Correctness: `tools/compare_native.py`
+
+Runs both cores on identical input and checks logical behaviour. Latest:
+
+```
+host TX  python: b'>[:np] Hello world.\r\n>'
+host TX  native: b'>[:np] Hello world.\r\n>'     -> MATCH (exact)
+LED      python: 0xda   native: 0xda             -> MATCH
+audio    exact-equal samples: 27663 (42.56%)
+  python  min=-11792 max=14608 rms=1793.5
+  native  min=-12336 max=14608 rms=1790.0
+  speech blocks (100ms): python=36  native=36
+  speech envelope MATCHES; rms ratio 0.998
+unmapped memory accesses: 0
+RESULT: PASS
+```
+
+**Bit-identical audio is not expected and not required.** The Python core
+carries its own *approximate* 68000 cycle counts; Musashi's are accurate.
+That shifts the 68000↔DSP interleaving slightly, so individual samples
+differ (~43% happen to match) while everything that matters is the same:
+identical host-TX protocol bytes, identical speech duration (36 blocks
+each), identical peak amplitude, RMS within 0.2%. The check asserts those
+invariants rather than sample equality.
+
+**Confirmed by ear (2026-07-31)**: the user listened to
+`build/compare_native.wav` against the known-good `build/speak_test3.wav`
+(the Python output validated in §12) and reports them **indistinguishable**.
+So the ~57% of samples that differ numerically are perceptually
+irrelevant, as the envelope/RMS analysis predicted. The native core is
+now the validated implementation; the Python one remains the readable
+reference and the oracle for `tools/compare_native.py`.
+
+### Performance
+
+| workload | realtime factor |
+|---|---|
+| cold boot + 0.5s settle | 0.12s wall (total) |
+| short utterance (6s) | **10.1x** |
+| typical sentence (10s) | **10.3x** |
+| long paragraph (30s) | **10.6x** |
+
+~10x with comfortable headroom for a screen reader, and the 0.12s cold
+boot means synth startup isn't a noticeable stall. `dtc01_is_idle()` was
+verified to do what §7's synthetic-indexing design needs (True before
+feed, False while speaking, True again once both FIFOs drain).
+
+### Build
+
+`tools/build_native.bat [x64|x86]` → `build/dtc01_{x64,x86}.dll`.
+Both build clean, and both import **only `KERNEL32.dll`** (built `/MT`,
+static CRT) — so no VC++ redistributable is needed and they load in any
+process.
+
+**CORRECTION (2026-07-31): NVDA is x64, not x86.** Earlier notes in this
+section claimed "x86 is what NVDA ships" — that was an out-of-date
+assumption, checked and disproved against the actual installation:
+
+```
+C:\Program Files\NVDA\nvda.exe   -> PE machine = x64
+C:\Program Files\NVDA\python313.dll -> x64   (NVDA 2026.1.1, Python 3.13)
+C:\Program Files (x86)\NVDA\     -> leftover dir, contains no nvda.exe
+```
+
+So **`dtc01_x64.dll` is the binary NVDA needs**, and it is the one already
+exercised end-to-end. The `_synthDrivers32` folder inside NVDA is only the
+legacy out-of-process bridge for 32-bit SAPI4/SAPI5 COM synths; a Python
+synth driver using ctypes runs in NVDA's main x64 process, so it needs an
+x64 DLL. The x86 build is retained only as optional legacy support (old
+NVDA / 32-bit Windows) and is still unexercised — nothing depends on it.
+
+### Verified inside real NVDA (2026-07-31)
+
+`tools/make_test_addon.py` packages `addon/globalPlugins/dtc01NativeTest.py`
+into an installable dev-only addon that boots the emulator in NVDA's own
+process a few seconds after startup and announces the result through the
+active synth. Installed into NVDA 2026.1.1 (x64, Python 3.13), it reported:
+
+> **"DTC-01 native test passed. 9 times realtime."**
+
+That closes the last real deployment unknown: the DLL loads and runs
+in-process under NVDA's Python 3.13 (not just the dev interpreter), the
+`synthDrivers.dectalkDtc01.emu.native` import path resolves from inside a
+packaged addon, the firmware boots to LED `0xDA`, synthesis produces
+audio, host-TX bytes are correct, and unmapped accesses are 0. ~9x
+realtime *while NVDA is actively running* (vs ~10x on an idle dev
+interpreter) — the small drop is expected contention, and the headroom is
+still large.
+
+Both DLLs import **only `KERNEL32.dll`** (static CRT via `/MT`), so no
+VC++ redistributable is a deployment prerequisite.
+
+The test addon is throwaway: it announces on *every* NVDA start, ships no
+ROMs, and reads them from a hardcoded dev path (`DTC01_ROM_DIR` overrides).
+Remove it once the real driver exists.
+
+**Host caveat:** this machine is ARM64 hardware running an x64-emulated
+Python, and its MSVC 14.44 has *no arm64 target* installed (only x64/x86
+under Hostx64/Hostarm64). A native-ARM64 NVDA would need the ARM64
+toolchain added; `native.py`'s arch detection already anticipates an
+`arm64` tag.
+
+## 15. Design Voice parameter ranges — corrected from the ROM (2026-07-31)
+
+§6's `[:dv]` table came from an OCR of the manual and is **wrong for
+several parameters**. The firmware will report its own values: sending
+`[:dv listall]` makes it print each parameter's current value and legal
+range over the host link. `tools/dump_voice_defaults.py` queries every
+built-in voice this way; the result is baked into
+`protocol/commands.py` as `VOICE_PARAM_DEFAULTS`.
+
+| param | §6 (OCR) | ROM says | note |
+|---|---|---|---|
+| `hs` head size | 75–150 % | **40–200 %** | |
+| `ap` average pitch | 50–300 Hz | **30–300 Hz** | |
+| `br` breathiness | 0–60 dB | **0–72 dB** | |
+| `sm` smoothness | 0–24 dB | **0–100 %** | unit was wrong too |
+| `pr` pitch range | 0–250 % | 0–250 % | matches |
+| `ri` richness | 0–100 % | 0–100 % | matches |
+
+The ROM also reports `g5` "Loudness (gain of resonator 5)", 0–80 dB — a
+real hardware volume control. The driver still does volume as software
+gain on the DAC output, which is smoother and doesn't interact with the
+voice's timbre, but `g5` is the authentic alternative if that's ever
+wanted.
+
+**Per-voice defaults matter more than the ranges.** A voice's default is
+often nowhere near the middle of its band:
+
+| voice | `ap` | `pr` | `hs` | `br` | `ri` | `sm` |
+|---|---|---|---|---|---|---|
+| Perfect Paul | 120 | 100 | 100 | 0 | 80 | 54 |
+| Beautiful Betty | 180 | 160 | 100 | 46 | 0 | 44 |
+| Huge Harry | **78** | 50 | 120 | 0 | 86 | 34 |
+| Frail Frank | 153 | 90 | 90 | 50 | 80 | 36 |
+| Kit the Kid | **306** | 180 | 80 | 40 | 40 | 44 |
+| Rough Rita | 106 | 80 | 95 | 0* | 49* | 34 |
+| Uppity Ursula | 264 | 135 | 95 | 0 | 100 | 64 |
+
+(*Rita: `ri` 0, `br` 49 — the columns above follow the query output.)
+
+This caused a real user-visible bug. The driver originally mapped each
+NVDA slider linearly onto the *absolute* range and sent nothing at 50,
+so 50 meant "the voice's own default" while 51 meant a value from the
+middle of the absolute band. On Huge Harry that is 78 Hz versus ~183 Hz —
+a slider step of one produced a huge jump, and moving 45→50→55 went
+"high, very low, high again".
+
+Sliders are now **relative to the selected voice**: 50 = that voice's
+default, 0 → the parameter's minimum, 100 → its maximum, piecewise linear
+through the default, so the midpoint is continuous (Harry: 49→77, 50→78,
+51→82). Changing voice resets the sliders to 50, because the same slider
+position means different absolute values on different voices.
+
+Two consequences worth knowing:
+- Kit's default `ap` (306) is **above** the maximum the ROM reports (300),
+  so there is no headroom above 50 on her pitch slider — it stays at 306.
+  `voice_param()` widens the bounds to include the default rather than
+  clamping the voice's own value.
+- Where a default sits at a range end (Paul's breathiness is 0), that half
+  of the slider is flat. That is the firmware's own doing, not a mapping
+  bug.
+
+## 8. Open follow-ups (not yet resolved — do not assume)
+
+- ~~Built-in voice table~~ **RESOLVED 2026-07-28**: see section 6b above.
+- ~~DSP ROM byte-interleave order~~ **RESOLVED 2026-07-28**: assembled
+  image's first two words are `F900 00E1`, which is exactly TMS32010's
+  unconditional `B` (branch) opcode with target `0x0E1` — a textbook-sane
+  reset handler. Confirms `e70`=high byte, `e69`=low byte, same convention
+  as the main CPU ROMs. Main CPU image also validated: reset vector
+  SSP=`0x0008c000` (in RAM), PC=`0x000001fe` (in ROM) — both sane.
+  See `tools/build_rom_images.py`.
+- Exact built-in voice mnemonic table (Table 5-2) — need to fetch/OCR.
+- `ef`/`f4`/`f5` unit and coupling ambiguity from OCR noise (§6) — verify
+  against ROM disassembly behavior once the emulator can run, or find a
+  cleaner scan of the manual.
+- SCN2681 DUART: only channel B (host RS-232) is required functionally;
+  channel A and the self-test-heavy DUART IP/OP pins can be minimally
+  stubbed as long as POST self-tests are bypassed (dipswitch "Skip Self
+  Test (IP4)" — driver already documents this path).
+- NVRAM persistence across NVDA restarts — nice-to-have, not required for
+  v1; can always cold-boot from the ROM-embedded default NVRAM image
+  (`ROM_REGION(0x100,"nvram")`, decoded in the driver source).
