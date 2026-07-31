@@ -54,7 +54,9 @@ MANIFEST = """name = dectalkDtc01
 summary = "DECtalk DTC-01"
 description = \"\"\"Speech synthesizer driver for the 1984 DEC DECtalk DTC-01. The original 68000 and TMS32010 firmware runs in an emulator inside NVDA, so the voice is the real hardware's, not a recreation.
 
-Requires your own dump of the DTC-01 firmware ROMs; none are included. Place the ROM files in the "dectalkDtc01\\\\roms" folder inside your NVDA user configuration directory.\"\"\"
+Requires your own dump of the DTC-01 firmware ROMs; none are included. Place the ROM files in the "dectalkDtc01\\\\roms" folder inside your NVDA user configuration directory.
+
+Includes both 64-bit and 32-bit emulator cores; the matching one is selected automatically.\"\"\"
 author = "dtc-01 project"
 version = {version}
 minimumNVDAVersion = 2025.1
@@ -93,9 +95,17 @@ def main() -> int:
             print("ERROR: NVDA API check failed; refusing to package.")
             return 1
 
-    dll = BUILD / f"dtc01_{args.arch}.dll"
-    if not dll.is_file():
-        print(f"ERROR: {dll} not found. Run  tools\\build_native.bat {args.arch}")
+    # Bundle every architecture that has been built. emu/native.py picks the
+    # matching DLL at load time, so one package serves both 64- and 32-bit
+    # NVDA. Shipping x64 alone produced an add-on that installed happily on
+    # 32-bit NVDA and then failed to load its DLL, with nothing saying why.
+    dlls = [BUILD / f"dtc01_{a}.dll" for a in ("x64", "x86")]
+    dlls = [d for d in dlls if d.is_file()]
+    if not dlls:
+        print(f"ERROR: no dtc01_*.dll in {BUILD}. Run  tools\\build_native.bat")
+        return 1
+    if args.arch not in [d.stem.split("_")[1] for d in dlls]:
+        print(f"ERROR: dtc01_{args.arch}.dll not built")
         return 1
 
     stage = BUILD / f"_stage_addon_{args.arch}"
@@ -112,7 +122,8 @@ def main() -> int:
                                       "*.exp", "roms"),
     )
     (stage / "synthDrivers" / "__init__.py").write_text("", encoding="utf-8")
-    shutil.copy2(dll, dst_pkg / "emu" / dll.name)
+    for d in dlls:
+        shutil.copy2(d, dst_pkg / "emu" / d.name)
 
     # The update checker ships; the native smoke test does not -- it is a
     # development tool that announces itself on every NVDA start.
@@ -121,7 +132,7 @@ def main() -> int:
     shutil.copy2(ADDON / "globalPlugins" / "dtc01Updater.py",
                  plugins / "dtc01Updater.py")
 
-    out = BUILD / f"dectalkDtc01-{version}-{args.arch}.nvda-addon"
+    out = BUILD / f"dectalkDtc01-{version}.nvda-addon"
     if out.exists():
         out.unlink()
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:

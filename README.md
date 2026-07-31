@@ -24,7 +24,7 @@ say-all, index reporting, and rate boost beyond the hardware's own ceiling.
 
 ## Requirements
 
-* NVDA 2025.1 or later, 64-bit
+* NVDA 2025.1 or later (64-bit or 32-bit -- both emulator cores ship in the package)
 * Your own DTC-01 v2.0 ROM dump (16 main-CPU chips + the `204`/`205` DSP pair)
 
 ## Providing the ROMs
