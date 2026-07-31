@@ -329,10 +329,16 @@ and two new live-instrumentation scripts (`tools/trace_spc_queue.py`,
 `tools/trace_task_wait.py`) that monkeypatch `SystemBus.write8/16/32` to log
 writes to specific regions with the executing PC, run against the real ROMs
 via `DectalkMachine` directly (not through `emu.uc`/Unicorn — those are gone
-per §9's architecture pivot; `tools/boot_test.py` and `tools/diag_step.py`
-are now **stale/pre-pivot** and reference a `m.uc` attribute that no longer
-exists — don't trust them without updating first, use `tools/speak_test.py`
-as the current reference for how to drive `DectalkMachine`).
+per §9's architecture pivot).
+
+> **Correction (2026-07-31):** this section previously said *both*
+> `tools/boot_test.py` and `tools/diag_step.py` were stale pre-pivot tools
+> referencing a `m.uc` attribute. Only `diag_step.py` was — it imported
+> `unicorn` directly and has been deleted. `boot_test.py` never touched
+> Unicorn and still runs correctly against the Python core; it was checked
+> before removal and reports the LED self-test progression
+> (`0x00` → `0xff` → `0xda`) as expected. Use `tools/speak_test.py` as the
+> reference for driving `DectalkMachine`.
 
 **Confirmed call chain, RX side:**
 - Level-6 vector = `0x1706` → saves regs, calls a RAM function-pointer at
