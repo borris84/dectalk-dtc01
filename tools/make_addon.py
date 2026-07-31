@@ -12,6 +12,7 @@ Output: build/dectalkDtc01-<version>-<arch>.nvda-addon
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import subprocess
 import sys
@@ -48,13 +49,45 @@ ROOT = Path(__file__).resolve().parent.parent
 ADDON = ROOT / "addon"
 BUILD = ROOT / "build"
 
+
+def resolve_rom_dir(spec):
+	"""Locate and validate a ROM set for a --with-roms private build.
+
+	Validated with the driver's own loader rather than by counting files: a
+	package that ships an incomplete or altered set would fail at runtime on
+	the very machines the build exists to test, with the ROMs looking present.
+	"""
+	if spec == "auto":
+		appdata = os.environ.get("APPDATA")
+		if not appdata:
+			print("ERROR: APPDATA is unset; pass --with-roms DIR explicitly")
+			return None
+		path = Path(appdata) / "nvda" / "dectalkDtc01" / "roms"
+	else:
+		path = Path(spec)
+	if not path.is_dir():
+		print(f"ERROR: no ROM directory at {path}")
+		return None
+	sys.path.insert(0, str(ADDON / PKG_REL))
+	try:
+		from emu import rom_loader
+		rom_loader.validate_rom_dir(str(path))
+	except Exception as e:
+		print(f"ERROR: ROMs in {path} are not a valid set: {e}")
+		return None
+	finally:
+		sys.path.pop(0)
+	n = len([p for p in path.iterdir() if p.is_file()])
+	print(f"PRIVATE BUILD: bundling {n} validated ROM files from {path}")
+	return path
+
 PKG_REL = Path("synthDrivers/dectalkDtc01")
 
 MANIFEST = """name = dectalkDtc01
-summary = "DECtalk DTC-01"
+summary = {summary}
 description = \"\"\"Speech synthesizer driver for the 1984 DEC DECtalk DTC-01. The original 68000 and TMS32010 firmware runs in an emulator inside NVDA, so the voice is the real hardware's, not a recreation.
 
-Requires your own dump of the DTC-01 firmware ROMs; none are included. Place the ROM files in the "dectalkDtc01\\\\roms" folder inside your NVDA user configuration directory.
+{roms_note}
 
 Includes both 64-bit and 32-bit emulator cores; the matching one is selected automatically.\"\"\"
 author = "dtc-01 project"
@@ -63,6 +96,19 @@ minimumNVDAVersion = 2025.1
 lastTestedNVDAVersion = 2026.1
 """
 
+ROMS_NOTE_DIST = ('Requires your own dump of the DTC-01 firmware ROMs; none are '
+                  'included. Place the ROM files in the "dectalkDtc01\\\\roms" folder '
+                  'inside your NVDA user configuration directory.')
+
+# --with-roms only. The firmware is DEC/Fonix property, so a package carrying
+# it is the builder's own dump moved between their own machines and nothing
+# else -- it must never be uploaded, released or shared (DESIGN.md §0).
+ROMS_NOTE_LOCAL = ('*** PRIVATE BUILD -- DO NOT DISTRIBUTE. *** This package '
+                   'contains DTC-01 firmware ROMs, which are Digital Equipment '
+                   'Corporation / Fonix property. It exists only to move one '
+                   "person's own ROM dump onto their own test machines. Do not "
+                   'upload, release or share it.')
+
 
 def main() -> int:
     ap = argparse.ArgumentParser()
@@ -70,9 +116,19 @@ def main() -> int:
                     help="DLL to bundle; NVDA 2026 is x64 (DESIGN.md §14)")
     ap.add_argument("--version", default=None,
                     help="override the VERSION file (not normally needed)")
+    ap.add_argument("--with-roms", nargs="?", const="auto", default=None,
+                    metavar="DIR",
+                    help="PRIVATE BUILD: bundle firmware ROMs from DIR (default: "
+                         "your NVDA config ROM dir). Never distribute the result.")
     args = ap.parse_args()
 
     version = args.version or read_version()
+
+    romDir = None
+    if args.with_roms is not None:
+        romDir = resolve_rom_dir(args.with_roms)
+        if romDir is None:
+            return 1
     tag = git_tag()
     if tag and tag.lstrip("vV") != version:
         print(f"NOTE: VERSION is {version} but the latest git tag is {tag} -- "
@@ -113,7 +169,13 @@ def main() -> int:
         shutil.rmtree(stage)
     stage.mkdir(parents=True)
 
-    (stage / "manifest.ini").write_text(MANIFEST.format(version=version), encoding="utf-8")
+    (stage / "manifest.ini").write_text(
+        MANIFEST.format(
+            version=version,
+            summary='"DECtalk DTC-01 (private ROM build)"' if romDir else '"DECtalk DTC-01"',
+            roms_note=ROMS_NOTE_LOCAL if romDir else ROMS_NOTE_DIST,
+        ),
+        encoding="utf-8")
 
     dst_pkg = stage / PKG_REL
     shutil.copytree(
@@ -125,6 +187,12 @@ def main() -> int:
     for d in dlls:
         shutil.copy2(d, dst_pkg / "emu" / d.name)
 
+    # <addon>/roms is the driver's last-resort ROM location (__init__.py
+    # _candidateRomDirs), below the config dir -- so a bundled set is used
+    # only where the machine has no dump of its own.
+    if romDir:
+        shutil.copytree(romDir, dst_pkg / "roms")
+
     # The update checker ships; the native smoke test does not -- it is a
     # development tool that announces itself on every NVDA start.
     plugins = stage / "globalPlugins"
@@ -132,7 +200,10 @@ def main() -> int:
     shutil.copy2(ADDON / "globalPlugins" / "dtc01Updater.py",
                  plugins / "dtc01Updater.py")
 
-    out = BUILD / f"dectalkDtc01-{version}.nvda-addon"
+    # The filename is the main thing standing between a private build and an
+    # accidental upload, so make it impossible to confuse with a release.
+    suffix = "-PRIVATE-WITH-ROMS-DO-NOT-DISTRIBUTE" if romDir else ""
+    out = BUILD / f"dectalkDtc01-{version}{suffix}.nvda-addon"
     if out.exists():
         out.unlink()
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
@@ -144,16 +215,28 @@ def main() -> int:
         names = z.namelist()
         total = sum(i.file_size for i in z.infolist())
 
-    # Hard guard: never ship firmware.
-    suspect = [n for n in names
-               if n.lower().endswith((".bin", ".rom", ".e1", ".e2", ".u21"))
-               or "rom" in Path(n).parent.name.lower()]
-    if suspect:
-        print("ERROR: refusing to ship, ROM-like files present:", suspect)
+    romFiles = [n for n in names
+                if n.lower().endswith((".bin", ".rom", ".e1", ".e2", ".u21"))
+                or "rom" in Path(n).parent.name.lower()]
+    if romDir:
+        # Inverted guard: the whole point of this build is the ROMs, so verify
+        # they actually made it in rather than handing over a package that
+        # silently behaves like the distributable one.
+        if not romFiles:
+            print("ERROR: --with-roms was given but no ROM files are in the package")
+            out.unlink()
+            return 1
+    elif romFiles:
+        # Hard guard: never ship firmware.
+        print("ERROR: refusing to ship, ROM-like files present:", romFiles)
         out.unlink()
         return 1
 
     print(f"built {out}")
+    if romDir:
+        print(f"  {len(romFiles)} ROM files bundled")
+        print("  *** PRIVATE BUILD -- contains DEC/Fonix firmware. Do not upload,")
+        print("      release, or attach to a GitHub release. Local testing only.")
     print(f"  {len(names)} files, {out.stat().st_size/1024:.0f} KB packed "
           f"/ {total/1024:.0f} KB unpacked")
     for n in names:
