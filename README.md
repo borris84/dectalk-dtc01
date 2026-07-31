@@ -81,12 +81,36 @@ Needs MSVC (Build Tools are enough) and Python 3.
 
 ```
 tools\build_native.bat          # builds build\dtc01_x64.dll (and x86)
-python tools\make_addon.py      # -> build\dectalkDtc01-<ver>-x64.nvda-addon
+python tools\make_addon.py      # -> build\dectalkDtc01-<ver>.nvda-addon
 ```
 
 Packaging refuses to run if any NVDA symbol the add-on imports is missing
 from your installed NVDA (`tools/check_nvda_api.py`), and the add-on is
 verified to contain no ROM data.
+
+### Private builds with firmware bundled
+
+`python tools\make_addon.py --with-roms` bundles a ROM set into the package
+at `<addon>/roms`, so it can be installed on a test machine without setting
+up firmware there first. It exists to move **your own** dump between **your
+own** machines.
+
+> The result must never be uploaded, released or shared — the firmware is
+> Digital Equipment Corporation / Fonix property. The output is named
+> `...-PRIVATE-WITH-ROMS-DO-NOT-DISTRIBUTE.nvda-addon` and marks itself in
+> the manifest, but the filename is not a safety mechanism. The default
+> build is the only one fit to distribute.
+
+⚠ **Rebuild after every update.** Installing a newer release over a private
+build replaces the add-on directory, and the bundled ROMs go with it. On a
+machine that has no dump of its own, the synth then stops working —
+`findRomDir` finds nothing and the driver reports no ROMs. Either re-run
+`--with-roms` for the new version and install that instead, or put a dump in
+`%APPDATA%\nvda\dectalkDtc01\roms\` on those machines, which survives
+updates and takes priority over the bundled copy.
+
+This also applies to the built-in update check, which will offer the public
+release on a machine running a private build.
 
 Musashi's opcode tables are generated rather than checked in; the build
 script produces them on first run and verifies them.
