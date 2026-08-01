@@ -11,7 +11,7 @@ sample set.
 
 ## Status
 
-**0.5.55 is released** — download the `.nvda-addon` from
+**0.5.56 is released** — download the `.nvda-addon` from
 [Releases](https://github.com/borris84/dectalk-dtc01/releases/latest). The
 add-on checks for later releases itself and offers to install them.
 
@@ -21,7 +21,7 @@ say-all, index reporting, and rate boost beyond the hardware's own ceiling.
 
 | | |
 |---|---|
-| Latest release | 0.5.55 |
+| Latest release | 0.5.56 |
 | Emulation speed | ~19.7x realtime (native C core, PGO build) |
 | Startup | ~0.5s to first speech |
 | Latency | ~50ms typical from request to audio |

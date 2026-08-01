@@ -1141,6 +1141,38 @@ exceeds the cancelled-keystroke latency budget already accepted.
 a *clean* instance and `fallbacks=0` in every stats line, so the all-dirty
 path never ran. It reduces churn; it is not known to reduce phrase loss.
 
+## 18. Auto-update never applied (2026-08-01) — install without restart
+
+Symptom on a second machine updating 0.5.2 → 0.5.55: the offer dialog
+appeared, the package downloaded, and then nothing. The log ended at
+`DTC-01 updater: offering v0.5.55 from ...` with no error.
+
+Cause: `gui.addonGui.installAddon()` installs the bundle but does **not**
+offer to restart — that is a separate `promptUserForRestart()`, which NVDA's
+own Add-on Store calls after installing (`addonStoreGui/controls/storeDialog`
+references both, plus "Add-ons pending install, restart required"). Without
+it the add-on sits staged in `<name>.pendingInstall` and nothing applies it or
+says so. **Restarting NVDA applies a staged install**, which is the recovery
+if this is seen again on an old build.
+
+Two things made it hard to see:
+
+- The success log was written *before* the work: it logged "offering" right
+  after `wx.CallAfter` scheduled the call, so it reported success for merely
+  scheduling. Outcome logging now happens after the attempt, and distinguishes
+  a failure from the user declining NVDA's own confirmation.
+- `tools/check_nvda_api.py` did not and **could not** catch this. The gate
+  checks that imported symbols exist; `installAddon` exists. This was a wrong
+  assumption about what a function *does*. Do not expect that gate to cover
+  behaviour — only end-to-end exercise of the update path does, and that path
+  had never been run.
+
+Related trap, hit at the same time: that machine was running a private
+`--with-roms` build, so updating to a public release removed its bundled
+firmware (README documents this). Either keep a dump in
+`<NVDA config>/dectalkDtc01/roms/`, which survives updates and outranks the
+bundled copy, or re-install a fresh `--with-roms` package.
+
 ## 8. Open follow-ups (not yet resolved — do not assume)
 
 - ~~Built-in voice table~~ **RESOLVED 2026-07-28**: see section 6b above.

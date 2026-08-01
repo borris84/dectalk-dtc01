@@ -106,15 +106,55 @@ def _installUpdate(url, assetName, version):
 		return
 	try:
 		import wx
-		import gui
-		# Hand the package to NVDA's own installer rather than unpacking it
-		# here, so signature/compatibility handling stays NVDA's job.
-		from gui import addonGui
-		wx.CallAfter(addonGui.installAddon, gui.mainFrame, target)
-		log.info(f"DTC-01 updater: offering {version} from {target}")
+		wx.CallAfter(_finishInstall, target, version)
 	except Exception:
-		log.error("DTC-01 updater: could not hand the package to NVDA; "
-				  f"it is downloaded at {target}", exc_info=True)
+		log.error("DTC-01 updater: could not schedule the install; "
+				  f"the package is downloaded at {target}", exc_info=True)
+
+
+def _finishInstall(target, version):
+	"""Install the downloaded bundle. Must run on the main thread.
+
+	Two things this has to get right, both of which it previously did not:
+
+	1. `addonGui.installAddon` installs but does **not** offer to restart --
+	   that is a separate `promptUserForRestart`. Without it the add-on sits
+	   staged in `<name>.pendingInstall` and nothing applies it or says so,
+	   which looks exactly like "it downloaded and then did nothing".
+	2. The outcome has to be logged *after* the attempt. Logging on the way in
+	   reported success for merely scheduling the call, so a failed install
+	   left a log saying it had been offered and nothing else.
+	"""
+	import gui
+	from gui import addonGui
+	try:
+		installed = addonGui.installAddon(gui.mainFrame, target)
+	except Exception:
+		log.error(f"DTC-01 updater: installing {version} from {target} failed",
+				  exc_info=True)
+		return
+	if not installed:
+		# Includes the user declining NVDA's own confirmation, which is not an
+		# error -- but it is worth being able to tell apart from a failure.
+		log.info(f"DTC-01 updater: {version} was not installed "
+				 "(declined, or NVDA rejected the bundle)")
+		return
+	log.info(f"DTC-01 updater: {version} staged; prompting for restart")
+	prompt = getattr(addonGui, "promptUserForRestart", None)
+	if prompt is not None:
+		prompt()
+		return
+	# Older/newer NVDA without that helper: ask plainly rather than leaving the
+	# update silently pending, which is the bug this function exists to fix.
+	import wx
+	if gui.messageBox(
+			_("The DECtalk DTC-01 driver has been updated to version {version}. "
+			  "NVDA must restart for the change to take effect. Restart now?"
+			  ).format(version=version),
+			_("DECtalk DTC-01 update"),
+			wx.YES_NO | wx.ICON_QUESTION) == wx.YES:
+		import core
+		core.restart()
 
 
 class GlobalPlugin(globalPluginHandler.GlobalPlugin):
