@@ -1235,6 +1235,63 @@ utterance can legitimately go quiet for 0.54s mid-way. **Drive the real
 SynthDriver.** Its `_pump` already knows what finished means; hand-rolled
 equivalents in a test script do not.
 
+## 20. The other half of it — the firmware pauses mid-utterance
+
+Fixing the line-length limit (§19) exposed a second, older bug: speech from
+one item surfacing attached to the next one, "moving up the list the previous
+line begins with the end of the last line".
+
+**The firmware goes quiet inside an utterance while it works out how to say
+something** -- measured at **450ms** before a long number in
+`Meddeau: oh that works; ... 20366 of 20366`. Our own buffers are empty during
+that pause too, so it is indistinguishable from the end by the test `_pump`
+was using: `SILENCE_BLOCKS = 6`, i.e. **150ms**. The utterance was declared
+finished mid-way, `_speakLine` returned, and the rest stayed in the firmware
+until the next utterance flushed it out.
+
+Measured internal gaps:
+
+| text | gap |
+|---|---|
+| `Meddeau: oh that works; ... 20366 of 20366` | **450ms** |
+| `Meddeau: weird? ... 20364 of 20366` | 150ms (exactly at the threshold) |
+| `Noof: I think for some stupid reason ...` | 75ms |
+| `Desktop list`, `Paperback 5 of 12` | 0ms |
+
+§19 made it far more visible: over-limit text used to be discarded by the
+firmware, so little was left to leak. Once the full text is accepted, an
+utterance cut short at 150ms strands seconds of speech.
+
+### Fix, and why it is conditional
+
+`LONG_SILENCE_BLOCKS = 28` (700ms) is used instead of 6 when the text is over
+`LONG_TEXT_CHARS` (40) **and say all is not running**, plus on every drain
+path -- draining is exactly where leftovers with gaps live.
+
+Both conditions matter:
+
+- Short text has no gaps at all (0ms measured), so key echo keeps the 150ms
+  threshold and stays responsive.
+- During say all the next chunk continues the same text, so speech left over
+  from an early "done" plays before it in the correct order and nothing sounds
+  wrong. Applying the long threshold there cost **+325ms at every line break**
+  (`sayall_sim` went from ±25ms to +325ms), which is precisely the pause say
+  all was tuned to remove. Restricting it to navigation restored ±25ms.
+
+Verified: gappy line 9.97s (was cut at the 450ms gap), a short line following
+it 0.85s against 0.85s spoken alone -- no leak; `sayall_sim` back to 5.30s vs
+5.35s ideal; length remains linear to 899 characters.
+
+### Signals that turned out not to work
+
+- **`>` prompt.** The firmware does emit one, but at 0.40s for an utterance
+  whose audio ran to 15.12s -- it means "line accepted", not "finished".
+- **DSP reset.** `dtc01_dsp_active` was added on the theory that the firmware
+  parks the DSP between utterances. It does not: the DSP stayed active
+  throughout and was still active after the audio ended and `is_idle` was
+  true. The accessor is kept because it is cheap and correct about what it
+  reports, but it is not an end-of-utterance signal.
+
 ## 8. Open follow-ups (not yet resolved — do not assume)
 
 - ~~Built-in voice table~~ **RESOLVED 2026-07-28**: see section 6b above.

@@ -656,6 +656,10 @@ DTC01_API int dtc01_is_idle(const dtc01_t *m)
             m->pending_count == 0 && duart_rx_b_pending(&m->duart) == 0) ? 1 : 0;
 }
 
+/* The firmware parks the DSP in reset between utterances, so this is its own
+ * answer to "am I still synthesizing?" -- unlike an absence of audio, which
+ * is also true during a pause inside an utterance. */
+DTC01_API int dtc01_dsp_active(const dtc01_t *m)       { return m ? !m->dsp.in_reset : 0; }
 DTC01_API int dtc01_get_led(const dtc01_t *m)          { return m ? m->led_state : 0; }
 DTC01_API int dtc01_infifo_count(const dtc01_t *m)     { return m ? m->infifo_count : 0; }
 DTC01_API int dtc01_outfifo_count(const dtc01_t *m)    { return m ? m->outfifo_count : 0; }

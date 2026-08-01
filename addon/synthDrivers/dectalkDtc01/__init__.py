@@ -79,6 +79,15 @@ BLOCK_SAMPLES = 250
 # because the FIFOs briefly empty between clauses mid-sentence.
 SILENCE_THRESHOLD = 120
 SILENCE_BLOCKS = 6          # 150ms of quiet (was 400ms)
+# ...but the firmware goes quiet *inside* an utterance while it works out how
+# to say something -- measured at 450ms before a long number ("20366 of
+# 20366"), where our own buffers are empty too, so it looks exactly like the
+# end. At 150ms the utterance was declared finished mid-way and the rest
+# surfaced attached to the next one. Short text has no such gap (measured 0ms
+# for "Desktop list" and "Paperback 5 of 12"), so key echo keeps the snappy
+# threshold and only text long enough to contain a pause pays for the wait.
+LONG_TEXT_CHARS = 40
+LONG_SILENCE_BLOCKS = 28    # 700ms, comfortably past the 450ms observed
 
 # Silence only counts as "finished" once we've actually heard speech. Right
 # after feed_text the DUART FIFO has already drained and the firmware is
@@ -816,9 +825,14 @@ class SynthDriver(SynthDriver):
 		# just run it out here. That keeps this instance clean and avoids
 		# consuming a spare, which matters because during fast typing cancels
 		# arrive faster than dirty instances can be recycled.
+		# Draining is precisely where the firmware's mid-utterance pauses show
+		# up, so a short silence threshold here declares an instance clean
+		# while it still holds speech -- which then comes out attached to the
+		# next utterance. Use the long threshold.
 		if self._pump(self._machines[self._activeIdx],
 					  maxBlocks=QUICK_DRAIN_BLOCKS,
-					  leadInBlocks=QUICK_DRAIN_LEADIN) == "done":
+					  leadInBlocks=QUICK_DRAIN_LEADIN,
+					  silenceBlocks=LONG_SILENCE_BLOCKS) == "done":
 			self._stats["quickDrainOk"] += 1
 			return False
 
@@ -839,7 +853,8 @@ class SynthDriver(SynthDriver):
 		self._stats["fallbacks"] += 1
 		started = time.monotonic()
 		if self._pump(machine, maxBlocks=FALLBACK_DRAIN_BLOCKS,
-					  leadInBlocks=QUICK_DRAIN_LEADIN) != "done":
+					  leadInBlocks=QUICK_DRAIN_LEADIN,
+					  silenceBlocks=LONG_SILENCE_BLOCKS) != "done":
 			self._stats["resets"] += 1
 			try:
 				machine.reset()
@@ -899,7 +914,7 @@ class SynthDriver(SynthDriver):
 
 	def _pump(self, machine, onBlock=None, isCancelled=None,
 			  maxBlocks=BOOT_MAX_BLOCKS, leadInBlocks=MAX_LEADIN_BLOCKS,
-			  trimSilence=False, onTick=None):
+			  trimSilence=False, onTick=None, silenceBlocks=SILENCE_BLOCKS):
 		"""Run the emulator until whatever it is currently rendering has been
 		fully spoken, optionally handing each audio block to `onBlock`.
 
@@ -995,7 +1010,7 @@ class SynthDriver(SynthDriver):
 
 			if machine.is_idle:
 				quiet += 1
-				if quiet >= SILENCE_BLOCKS:
+				if quiet >= silenceBlocks:
 					return "done"
 			else:
 				quiet = 0
@@ -1070,7 +1085,8 @@ class SynthDriver(SynthDriver):
 		machine = self._machine
 		if machine is None:
 			return
-		self._pump(machine, maxBlocks=DRAIN_MAX_BLOCKS)
+		self._pump(machine, maxBlocks=DRAIN_MAX_BLOCKS,
+				   silenceBlocks=LONG_SILENCE_BLOCKS)
 
 	def _render(self, generation, events, uttId=-1):
 		# The stats call has to be in a finally: nearly every utterance is
@@ -1316,6 +1332,16 @@ class SynthDriver(SynthDriver):
 			maxBlocks=UTTERANCE_MAX_BLOCKS,
 			trimSilence=True,
 			onTick=self._cleanSlice,
+			# Wait longer for the end only where a mistake is audible. During
+			# say all the next chunk continues the same text, so speech left
+			# over from an early "done" simply plays before it, in the right
+			# order -- and waiting there costs a pause at every line break,
+			# which is the thing say all was tuned to remove. While
+			# navigating, the next utterance is an unrelated item and the
+			# leftover is heard against the wrong text.
+			silenceBlocks=(LONG_SILENCE_BLOCKS
+						   if len(text) > LONG_TEXT_CHARS and not self._sayAllActive()
+						   else SILENCE_BLOCKS),
 		)
 		try:
 			tail = booster.flush()

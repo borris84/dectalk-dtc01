@@ -72,6 +72,10 @@ DTC01_API int  dtc01_get_volume(const dtc01_t *m);
 
 /* Introspection, for tests/diagnostics. */
 DTC01_API int dtc01_get_led(const dtc01_t *m);
+/* Non-zero while the firmware is synthesizing. It parks the DSP in reset
+ * between utterances, so unlike silence this distinguishes "finished" from
+ * "pausing mid-utterance". */
+DTC01_API int dtc01_dsp_active(const dtc01_t *m);
 DTC01_API int dtc01_infifo_count(const dtc01_t *m);
 DTC01_API int dtc01_outfifo_count(const dtc01_t *m);
 DTC01_API int dtc01_pending_text(const dtc01_t *m);
