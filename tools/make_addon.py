@@ -50,6 +50,43 @@ ADDON = ROOT / "addon"
 BUILD = ROOT / "build"
 
 
+def newest_native_source():
+	"""mtime of the most recently edited file the DLLs are built from."""
+	newest = 0.0
+	for p in (ROOT / "native").rglob("*"):
+		if p.is_file() and p.suffix.lower() in (".c", ".h"):
+			newest = max(newest, p.stat().st_mtime)
+	return newest
+
+
+def select_dll(arch):
+	"""Pick build/pgo/dtc01_<arch>.dll over build/dtc01_<arch>.dll, but only
+	when it is newer than every native source.
+
+	A PGO build is produced by a separate three-step cycle, so it goes stale
+	the moment anyone edits the emulator and runs the ordinary build. Shipping
+	a stale one would mean releasing a DLL built from code that no longer
+	exists, and nothing about the package would look wrong. This project has
+	already shipped one stale artifact behind a reassuring "built" banner.
+
+	Returns (path or None, is_pgo).
+	"""
+	plain = BUILD / f"dtc01_{arch}.dll"
+	pgo = BUILD / "pgo" / f"dtc01_{arch}.dll"
+	if pgo.is_file():
+		srcTime = newest_native_source()
+		if pgo.stat().st_mtime >= srcTime:
+			print(f"  {arch}: PGO build ({pgo})")
+			return pgo, True
+		print(f"  {arch}: WARNING - PGO build is older than native/ sources; "
+			  f"ignoring it and using the ordinary build. Re-run "
+			  f"tools\\build_pgo.bat to refresh it.")
+	if plain.is_file():
+		print(f"  {arch}: ordinary build ({plain})")
+		return plain, False
+	return None, False
+
+
 def resolve_rom_dir(spec):
 	"""Locate and validate a ROM set for a --with-roms private build.
 
@@ -116,6 +153,9 @@ def main() -> int:
                     help="DLL to bundle; NVDA 2026 is x64 (DESIGN.md §14)")
     ap.add_argument("--version", default=None,
                     help="override the VERSION file (not normally needed)")
+    ap.add_argument("--require-pgo", action="store_true",
+                    help="fail unless the --arch DLL is a PGO build (intended "
+                         "for release packaging; x86 always ships ordinary)")
     ap.add_argument("--with-roms", nargs="?", const="auto", default=None,
                     metavar="DIR",
                     help="PRIVATE BUILD: bundle firmware ROMs from DIR (default: "
@@ -155,13 +195,26 @@ def main() -> int:
     # matching DLL at load time, so one package serves both 64- and 32-bit
     # NVDA. Shipping x64 alone produced an add-on that installed happily on
     # 32-bit NVDA and then failed to load its DLL, with nothing saying why.
-    dlls = [BUILD / f"dtc01_{a}.dll" for a in ("x64", "x86")]
-    dlls = [d for d in dlls if d.is_file()]
+    dlls, pgoUsed = [], {}
+    for a in ("x64", "x86"):
+        chosen, isPgo = select_dll(a)
+        if chosen:
+            dlls.append(chosen)
+            pgoUsed[a] = isPgo
     if not dlls:
         print(f"ERROR: no dtc01_*.dll in {BUILD}. Run  tools\\build_native.bat")
         return 1
     if args.arch not in [d.stem.split("_")[1] for d in dlls]:
         print(f"ERROR: dtc01_{args.arch}.dll not built")
+        return 1
+    # Only the release architecture is held to this. x86 cannot be PGO'd here
+    # at all: training has to run the instrumented DLL in a matching-
+    # architecture process and there is no 32-bit Python on this machine, so
+    # requiring it everywhere would make the flag permanently unusable.
+    if args.require_pgo and not pgoUsed.get(args.arch):
+        print(f"ERROR: --require-pgo, but {args.arch} is not a PGO build. Run "
+              f"tools\\build_pgo.bat instrument, tools\\pgo_train.py, "
+              f"tools\\build_pgo.bat optimize.")
         return 1
 
     stage = BUILD / f"_stage_addon_{args.arch}"

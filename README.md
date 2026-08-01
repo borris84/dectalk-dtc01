@@ -11,7 +11,7 @@ sample set.
 
 ## Status
 
-**0.5.2 is released** — download the `.nvda-addon` from
+**0.5.3 is released** — download the `.nvda-addon` from
 [Releases](https://github.com/borris84/dectalk-dtc01/releases/latest). The
 add-on checks for later releases itself and offers to install them.
 
@@ -21,8 +21,8 @@ say-all, index reporting, and rate boost beyond the hardware's own ceiling.
 
 | | |
 |---|---|
-| Latest release | 0.5.2 |
-| Emulation speed | ~10x realtime (native C core) |
+| Latest release | 0.5.3 |
+| Emulation speed | ~10.3x realtime (native C core, PGO build) |
 | Startup | ~0.5s to first speech |
 | Latency | ~50ms typical from request to audio |
 | NVDA | 2026.1 (x64); built and tested against 2026.1.1 |
@@ -111,6 +111,18 @@ updates and takes priority over the bundled copy.
 
 This also applies to the built-in update check, which will offer the public
 release on a machine running a private build.
+
+### Release builds use PGO
+
+`tools\build_pgo.bat instrument` → `python tools\pgo_train.py` →
+`tools\build_pgo.bat optimize` produces a profile-guided build in
+`build\pgo\`, worth **+7–11%** with bit-identical output.
+`make_addon.py` prefers it automatically, but ignores it if it is older than
+anything in `native\` — a PGO build goes stale as soon as the emulator is
+edited, and shipping one built from code that no longer exists would look
+entirely normal. `--require-pgo` fails packaging rather than quietly
+producing a slower release. The 32-bit core is always an ordinary build:
+training has to run the instrumented DLL in a matching-architecture process.
 
 Musashi's opcode tables are generated rather than checked in; the build
 script produces them on first run and verifies them.

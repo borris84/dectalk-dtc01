@@ -979,6 +979,70 @@ Two consequences worth knowing:
   of the slider is flat. That is the firmware's own doing, not a mapping
   bug.
 
+## 16. Session 4 (2026-08-01) — optimisation: what worked and what didn't
+
+Question asked: can the core be made to run on slower CPUs? Baseline on this
+machine (x64 under Windows-on-ARM emulation, so all figures are through
+binary translation) was **~9.6x realtime**.
+
+### PGO: +7–11%, kept
+
+MSVC profile-guided optimisation, via `tools/build_pgo.bat` (instrument →
+`tools/pgo_train.py` → optimize). Measured +10.6% on the first build and
++7.2% after the scheduler change, both **bit-identical** output. It compiles
+all but 14 of 2305 functions for size, shrinking the DLL 465→368 KB; the win
+is almost certainly instruction-cache behaviour in the two dispatch loops.
+
+`tools/make_addon.py` now prefers `build/pgo/dtc01_<arch>.dll` — but **only
+when it is newer than every file in `native/`**, because a PGO DLL goes stale
+the moment the emulator is edited and the ordinary build is re-run. Shipping
+one built from code that no longer exists would look completely normal.
+`--require-pgo` enforces PGO for the release architecture. x86 cannot be
+PGO'd here: training must run the instrumented DLL in a matching-architecture
+process and there is no 32-bit Python on this machine.
+
+### The floating-point scheduler theory: DISPROVED
+
+`dtc01_run_samples` performed a `double` division per emulated 68000
+instruction (~1M/sec of audio) plus several double add/multiplies. Estimated
+at 10–25%. **Measured at ~1%, inside the noise floor.** Converting the DSP
+and DAC to integer counters gained +0.2%; additionally replacing the
+remaining division with a reciprocal multiply reached only +1.1%, against a
+1.2–1.3% run-to-run spread.
+
+Cost is dominated by `m68k_execute` and `tms_step` dispatch, not by the
+scheduler arithmetic — which is consistent with PGO (a code-layout
+optimisation) being the thing that does help. **Do not re-attempt this as a
+performance measure.** The planned follow-up converting `duart_step` to
+fixed-point was abandoned on this evidence: it would have disturbed the
+counter/timer that makes speech work at all (§11) for no measurable gain.
+
+### The integer scheduler was kept anyway — as a correctness fix
+
+Both clock ratios are exact integers (DSP = 68000/2, DAC = one sample per
+1000 68000 cycles), but the old code accumulated *seconds* in a double. A
+boundary exact in rational arithmetic is not exact in binary floating point,
+so `tools/test_scheduler_exact.py` (Fraction-based, no emulator needed)
+shows the float schedule put **772 of 7803 DAC samples (9.9%) on the wrong
+instruction**. The DAC is hardware-clocked at a fixed 10kHz, so
+exactly-periodic sampling is the faithful model and the jitter was an
+emulation artifact.
+
+Consequence: **18% of audio samples differ** from builds up to 0.5.2.
+Underruns (31 vs 32) and DAC tick count (126000) were unchanged, and
+`compare_native`, `test_driver_offline` and `sayall_sim` all pass.
+`emu/machine.py` mirrors the change so the reference oracle stays faithful.
+
+### Still untried
+
+- Batching `m68k_execute(n)` instead of one instruction per call. Plausibly
+  15–30%, but it coarsens the 68000↔DSP FIFO interleave — the exact thing
+  that took longest to get right. Would need `compare_native.py` as a gate.
+- Native ARM64 build (this host is ARM64; the toolchain target is not
+  installed). Irrelevant to low-end x86, which was the actual question.
+- `EMULATOR_INSTANCES = 3` costs ~0.9s of startup and 3x memory but buys no
+  throughput — Musashi's globals serialise all three behind one lock.
+
 ## 8. Open follow-ups (not yet resolved — do not assume)
 
 - ~~Built-in voice table~~ **RESOLVED 2026-07-28**: see section 6b above.
