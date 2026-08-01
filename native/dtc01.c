@@ -33,6 +33,14 @@
 #define M68K_HZ       10000000.0
 #define DSP_CYCLE_HZ  5000000.0  /* matches MAME's (clocks+3)/4 on a 20MHz part */
 
+/* Both clock ratios are exact integers, which is what lets the scheduler run
+ * on integer counters instead of accumulating seconds in a double. */
+#define M68K_PER_DSP  2          /* 10MHz / 5MHz  */
+#define M68K_PER_DAC  1000       /* 10MHz / 10kHz */
+typedef char dtc01_clock_ratios_are_exact[
+    ((int)M68K_HZ == (int)DSP_CYCLE_HZ * M68K_PER_DSP &&
+     (int)M68K_HZ == (int)DAC_SAMPLE_HZ * M68K_PER_DAC) ? 1 : -1];
+
 #define PENDING_SIZE 65536
 #define HOSTTX_SIZE  4096
 
@@ -58,9 +66,14 @@ struct dtc01 {
     int      irq_lines[8];
     int      pending_irq;
 
-    double   time_seconds;
-    double   dsp_cycle_debt;
-    double   dac_debt;
+    /* Scheduling is exact integer arithmetic in units of 68000 cycles: the
+     * DSP runs at half the 68000 clock and the DAC emits one sample per
+     * M68K_PER_DAC cycles, both exact ratios. Doing this in double cost a
+     * division per emulated instruction (~1M/sec of audio) and bought
+     * nothing -- these counters cannot drift. */
+    uint64_t m68k_cycles;       /* total elapsed, for dtc01_time_seconds() */
+    int      dsp_half_debt;     /* unconverted 68000 cycles, < 2 */
+    int      dac_debt;          /* 68000 cycles since the last DAC sample */
 
     uint8_t  pending[PENDING_SIZE];   /* host text not yet in the DUART FIFO */
     int      pending_head, pending_tail, pending_count;
@@ -451,9 +464,9 @@ static void machine_soft_state_init(dtc01_t *m)
     m->tlc_flags_latch = 0;
     memset(m->irq_lines, 0, sizeof(m->irq_lines));
     m->pending_irq = 0;
-    m->time_seconds = 0.0;
-    m->dsp_cycle_debt = 0.0;
-    m->dac_debt = 0.0;
+    m->m68k_cycles = 0;
+    m->dsp_half_debt = 0;
+    m->dac_debt = 0;
     m->pending_head = m->pending_tail = m->pending_count = 0;
     m->hosttx_head = m->hosttx_tail = m->hosttx_count = 0;
     m->unmapped = 0;
@@ -546,7 +559,6 @@ DTC01_API int dtc01_feed_text(dtc01_t *m, const uint8_t *data, int len)
 
 DTC01_API int dtc01_run_samples(dtc01_t *m, int16_t *out, int max_samples)
 {
-    const double dac_period = 1.0 / DAC_SAMPLE_HZ;
     int produced = 0;
 
     if (!m || !out || max_samples <= 0) return 0;
@@ -554,7 +566,6 @@ DTC01_API int dtc01_run_samples(dtc01_t *m, int16_t *out, int max_samples)
 
     while (produced < max_samples) {
         int cycles, spent;
-        double elapsed;
 
         if (m->pending_count > 0) drain_pending_text(m);
 
@@ -564,23 +575,29 @@ DTC01_API int dtc01_run_samples(dtc01_t *m, int16_t *out, int max_samples)
 
         cycles = m68k_execute(1); /* exactly one instruction */
         if (cycles <= 0) cycles = 1;
-        elapsed = (double)cycles / M68K_HZ;
-        m->time_seconds += elapsed;
+        m->m68k_cycles += (uint64_t)cycles;
 
-        duart_step(&m->duart, elapsed);
+        /* Still seconds, still a division: measured at ~1% of throughput,
+         * inside this machine's noise floor. Converting the DUART to
+         * fixed-point would buy nothing and would disturb the counter/timer
+         * whose behaviour is the reason speech works at all. */
+        duart_step(&m->duart, (double)cycles / M68K_HZ);
 
-        m->dsp_cycle_debt += elapsed * DSP_CYCLE_HZ;
+        /* DSP: exactly one cycle per M68K_PER_DSP 68000 cycles. tms_run
+         * returns the unspent budget (<= 0, an overshoot); as before it
+         * replaces the debt rather than adding to it. */
+        m->dsp_half_debt += cycles;
         if (!m->dsp.in_reset) {
-            spent = (int)m->dsp_cycle_debt;
+            spent = m->dsp_half_debt / M68K_PER_DSP;
             if (spent > 0)
-                m->dsp_cycle_debt = tms_run(&m->dsp, spent); /* carry overshoot */
+                m->dsp_half_debt = tms_run(&m->dsp, spent) * M68K_PER_DSP;
         }
 
-        m->dac_debt += elapsed;
-        while (m->dac_debt >= dac_period && produced < max_samples) {
+        m->dac_debt += cycles;
+        while (m->dac_debt >= M68K_PER_DAC && produced < max_samples) {
             uint16_t raw;
             int16_t pcm;
-            m->dac_debt -= dac_period;
+            m->dac_debt -= M68K_PER_DAC;
             raw = dsp_pop_outfifo(m);
             /* raw is the offset-binary DAC word; ^0x8000 recovers signed
              * PCM (see dtc01.h). */
@@ -619,7 +636,8 @@ DTC01_API int dtc01_pending_text(const dtc01_t *m)     { return m ? m->pending_c
 DTC01_API int dtc01_unmapped_accesses(const dtc01_t *m){ return m ? m->unmapped : 0; }
 DTC01_API int dtc01_outfifo_underruns(const dtc01_t *m){ return m ? m->outfifo_underruns : 0; }
 DTC01_API int dtc01_dac_ticks(const dtc01_t *m){ return m ? m->dac_ticks : 0; }
-DTC01_API double dtc01_time_seconds(const dtc01_t *m)  { return m ? m->time_seconds : 0.0; }
+/* Derived on demand -- the scheduler counts cycles, not seconds. */
+DTC01_API double dtc01_time_seconds(const dtc01_t *m)  { return m ? (double)m->m68k_cycles / M68K_HZ : 0.0; }
 
 DTC01_API int dtc01_read_ram32(const dtc01_t *m, uint32_t addr, uint32_t *out)
 {

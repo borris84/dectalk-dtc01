@@ -45,6 +45,10 @@ def main() -> int:
 	ap.add_argument("candidate")
 	ap.add_argument("--trials", type=int, default=7)
 	ap.add_argument("--samples", type=int, default=120000, help="10k = 1s of audio")
+	ap.add_argument("--allow-diff", action="store_true",
+					help="time the builds even though their output differs. Only "
+						 "for a change whose output SHOULD differ, and only once "
+						 "you have established why -- see tools/test_scheduler_exact.py")
 	args = ap.parse_args()
 
 	romDir = os.path.expandvars(r"%APPDATA%\nvda\dectalkDtc01\roms")
@@ -67,10 +71,16 @@ def main() -> int:
 	sa, sb = render(a, args.samples), render(b, args.samples)
 	if list(sa) != list(sb):
 		diff = sum(1 for x, y in zip(sa, sb) if x != y)
-		print(f"\n  *** OUTPUT DIFFERS: {diff}/{min(len(sa), len(sb))} samples, "
-			  f"lengths {len(sa)} vs {len(sb)} -- not a valid speedup")
-		return 1
-	print(f"  output identical over {len(sa)/SAMPLE_RATE:.1f}s of audio")
+		msg = (f"OUTPUT DIFFERS: {diff}/{min(len(sa), len(sb))} samples, "
+			   f"lengths {len(sa)} vs {len(sb)}")
+		if not args.allow_diff:
+			print(f"\n  *** {msg} -- not a valid speedup")
+			return 1
+		print(f"  *** {msg}")
+		print("      proceeding under --allow-diff; the timings below say nothing "
+			  "about whether that difference is correct")
+	else:
+		print(f"  output identical over {len(sa)/SAMPLE_RATE:.1f}s of audio")
 
 	def timed(m):
 		t = time.perf_counter()

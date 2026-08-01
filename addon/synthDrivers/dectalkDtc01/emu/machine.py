@@ -68,6 +68,14 @@ DAC_SAMPLE_HZ = 10000
 M68K_HZ = 10_000_000
 DSP_CYCLE_HZ = 20_000_000 // 4  # matches MAME's execute_clocks_to_cycles (clocks+3)//4
 
+# Both ratios are exact integers, so the DSP and DAC schedules are counted in
+# 68000 cycles rather than accumulated as seconds in a float. Accumulating
+# seconds put roughly 10% of DAC samples one instruction early or late,
+# because a boundary that is exact in rational arithmetic is not exact in
+# binary floating point (tools/test_scheduler_exact.py demonstrates this).
+M68K_PER_DSP = M68K_HZ // DSP_CYCLE_HZ    # 2
+M68K_PER_DAC = M68K_HZ // DAC_SAMPLE_HZ   # 1000
+
 
 class SystemBus:
 	"""Implements the m68000.Bus protocol against the DTC-01 memory map
@@ -223,8 +231,8 @@ class DectalkMachine:
 		self.cpu.reset()
 
 		self._time_seconds = 0.0
-		self._dsp_cycle_debt = 0.0
-		self._dac_sample_debt = 0.0
+		self._dsp_half_debt = 0   # unconverted 68000 cycles owed to the DSP
+		self._dac_debt = 0        # 68000 cycles since the last DAC sample
 
 	# =====================================================================
 	# Reset
@@ -416,24 +424,22 @@ class DectalkMachine:
 		time: interleave the 68000, the DSP, and the 10kHz DAC tick. See
 		module docstring for the timing-model caveat."""
 		end_time = self._time_seconds + seconds
-		dac_period = 1.0 / DAC_SAMPLE_HZ
 		while self._time_seconds < end_time:
 			self._maybe_service_interrupt()
 			cycles = self.cpu.step()
-			elapsed = cycles / M68K_HZ
-			self._time_seconds += elapsed
+			self._time_seconds += cycles / M68K_HZ
 
-			self.duart.step(elapsed)
+			self.duart.step(cycles / M68K_HZ)
 
-			self._dsp_cycle_debt += elapsed * DSP_CYCLE_HZ
+			self._dsp_half_debt += cycles
 			if not self.dsp.in_reset:
-				spent = int(self._dsp_cycle_debt)
+				spent = self._dsp_half_debt // M68K_PER_DSP
 				if spent > 0:
-					overshoot = self.dsp.run(spent)
-					self._dsp_cycle_debt = overshoot  # carry remainder (<=0) forward
+					overshoot = self.dsp.run(spent)  # <= 0
+					self._dsp_half_debt = overshoot * M68K_PER_DSP
 
-			self._dac_sample_debt += elapsed
-			while self._dac_sample_debt >= dac_period:
-				self._dac_sample_debt -= dac_period
+			self._dac_debt += cycles
+			while self._dac_debt >= M68K_PER_DAC:
+				self._dac_debt -= M68K_PER_DAC
 				sample = self._dsp_pop_outfifo()
 				self._on_audio_sample(sample)
