@@ -37,6 +37,20 @@
  * on integer counters instead of accumulating seconds in a double. */
 #define M68K_PER_DSP  2          /* 10MHz / 5MHz  */
 #define M68K_PER_DAC  1000       /* 10MHz / 10kHz */
+
+/* Upper bound on how many 68000 cycles run before the DSP and DUART are
+ * serviced. 1 reproduces the historical one-instruction-at-a-time schedule
+ * exactly. Larger values amortise Musashi's per-call state save/restore at
+ * the cost of a coarser interleave; override at build time to measure. */
+/* 32 measured +82% with the DSP no more than ~3.2us (3% of a DAC period)
+ * behind the 68000. Larger values keep paying: 128 gave +135% and 1000 gave
+ * +171%, both with underruns, RMS, peak and envelope length unchanged -- but
+ * they model the two processors as running concurrently ever more loosely,
+ * and this firmware's 68000/DSP handshake is the part that took longest to
+ * get right. 32 is the conservative end of the useful range. */
+#ifndef M68K_BATCH_CYCLES
+#define M68K_BATCH_CYCLES 32
+#endif
 typedef char dtc01_clock_ratios_are_exact[
     ((int)M68K_HZ == (int)DSP_CYCLE_HZ * M68K_PER_DSP &&
      (int)M68K_HZ == (int)DAC_SAMPLE_HZ * M68K_PER_DAC) ? 1 : -1];
@@ -565,7 +579,7 @@ DTC01_API int dtc01_run_samples(dtc01_t *m, int16_t *out, int max_samples)
     activate(m);
 
     while (produced < max_samples) {
-        int cycles, spent;
+        int cycles, spent, budget;
 
         if (m->pending_count > 0) drain_pending_text(m);
 
@@ -573,7 +587,20 @@ DTC01_API int dtc01_run_samples(dtc01_t *m, int16_t *out, int max_samples)
          * own copy each time it takes an interrupt. See set_irq(). */
         if (m->pending_irq) m68k_set_irq((unsigned int)m->pending_irq);
 
-        cycles = m68k_execute(1); /* exactly one instruction */
+        /* Musashi saves and restores its whole CPU state around every
+         * m68k_execute() call, so asking for one instruction at a time pays
+         * that overhead ~1M times per second of audio. Batching amortises it.
+         *
+         * The batch is capped at the cycles remaining before the next DAC
+         * sample, which keeps the 10kHz DAC exactly periodic: m68k_execute()
+         * runs until the budget is met and then finishes the instruction in
+         * progress, which is the same instruction that would have crossed the
+         * boundary one-at-a-time. What does change is how coarsely the DSP
+         * and DUART are interleaved with the 68000 -- hence the tunable. */
+        budget = M68K_PER_DAC - m->dac_debt;
+        if (budget > M68K_BATCH_CYCLES) budget = M68K_BATCH_CYCLES;
+        if (budget < 1) budget = 1;
+        cycles = m68k_execute(budget);
         if (cycles <= 0) cycles = 1;
         m->m68k_cycles += (uint64_t)cycles;
 

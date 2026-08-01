@@ -11,7 +11,7 @@ sample set.
 
 ## Status
 
-**0.5.3 is released** — download the `.nvda-addon` from
+**0.5.4 is released** — download the `.nvda-addon` from
 [Releases](https://github.com/borris84/dectalk-dtc01/releases/latest). The
 add-on checks for later releases itself and offers to install them.
 
@@ -21,8 +21,8 @@ say-all, index reporting, and rate boost beyond the hardware's own ceiling.
 
 | | |
 |---|---|
-| Latest release | 0.5.3 |
-| Emulation speed | ~10.3x realtime (native C core, PGO build) |
+| Latest release | 0.5.4 |
+| Emulation speed | ~19.7x realtime (native C core, PGO build) |
 | Startup | ~0.5s to first speech |
 | Latency | ~50ms typical from request to audio |
 | NVDA | 2026.1 (x64); built and tested against 2026.1.1 |
@@ -116,7 +116,7 @@ release on a machine running a private build.
 
 `tools\build_pgo.bat instrument` → `python tools\pgo_train.py` →
 `tools\build_pgo.bat optimize` produces a profile-guided build in
-`build\pgo\`, worth **+7–11%** with bit-identical output.
+`build\pgo\`, worth **+7–13%** with bit-identical output.
 `make_addon.py` prefers it automatically, but ignores it if it is older than
 anything in `native\` — a PGO build goes stale as soon as the emulator is
 edited, and shipping one built from code that no longer exists would look
@@ -143,8 +143,15 @@ loudly rather than handing you a DLL that crashes at runtime.
 python tools\test_driver_offline.py   # driver logic against the real emulator
 python tools\sayall_sim.py            # say-all, with NVDA's real handshake
 python tools\compare_native.py        # C core vs the Python reference
+python tools\test_scheduler_exact.py  # DSP/DAC timing vs exact rational maths
+python tools\bench_native.py A.dll B.dll   # A/B two builds, with an output-identity check
 python tools\check_no_roms.py         # refuse to commit firmware
 ```
+
+The emulator services the DSP and DUART every `M68K_BATCH_CYCLES` (32) 68000
+cycles rather than every instruction, which is worth ~+82%; the DAC stays
+exactly periodic regardless. Setting it to 1 restores the historical
+one-instruction schedule. See [DESIGN.md](DESIGN.md) §16.
 
 The pure-Python emulator in `addon/synthDrivers/dectalkDtc01/emu/` is kept as
 the readable reference implementation and correctness oracle; the C core in

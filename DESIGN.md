@@ -1033,11 +1033,47 @@ Underruns (31 vs 32) and DAC tick count (126000) were unchanged, and
 `compare_native`, `test_driver_offline` and `sayall_sim` all pass.
 `emu/machine.py` mirrors the change so the reference oracle stays faithful.
 
-### Still untried
+### Batching `m68k_execute(n)`: +82%, far more than estimated
 
-- Batching `m68k_execute(n)` instead of one instruction per call. Plausibly
-  15–30%, but it coarsens the 68000↔DSP FIFO interleave — the exact thing
-  that took longest to get right. Would need `compare_native.py` as a gate.
+Estimated at 15–30%. **Measured at +82%** for a 32-cycle batch, and it keeps
+paying beyond that. Musashi saves and restores its entire CPU state around
+every `m68k_execute()` call, so one instruction per call was spending most of
+its time on call overhead rather than emulation.
+
+The batch is capped at `M68K_PER_DAC - dac_debt`, i.e. the cycles remaining
+before the next DAC sample. That keeps the 10kHz DAC exactly periodic:
+`m68k_execute` meets the budget and then finishes the instruction in
+progress, which is the same instruction that would have crossed the boundary
+one-at-a-time. What batching actually coarsens is how often the DSP and DUART
+are serviced relative to the 68000.
+
+Measured across batch sizes (ordinary builds, interleaved trials, 5.6% noise
+floor), against the one-instruction schedule:
+
+| batch | speed | vs base | underruns | rms | peak | envelope |
+|---|---|---|---|---|---|---|
+| 1 | 9.73x | — | 32 | 1470 | 14304 | 71 |
+| 8 | 9.99x | +2.7% | 32 | 1470 | 14304 | 71 |
+| 32 | 17.72x | **+82%** | 28 | 1468 | 14304 | 70 |
+| 128 | 22.85x | +135% | 29 | 1470 | 14304 | 71 |
+| 1000 | 26.40x | +171% | 23 | 1464 | 14064 | 69 |
+
+Batch 8 is bit-identical to batch 1 — most 68000 instructions already cost
+≥8 cycles, so the budget rarely covers two. Underruns *improve* with
+batching (the DSP runs in larger chunks and keeps the FIFO fuller), and LED,
+unmapped accesses and host TX are identical throughout.
+
+`M68K_BATCH_CYCLES` defaults to **32**: the conservative end of the useful
+range, leaving the DSP no more than ~3.2µs (3% of a DAC period) behind the
+68000. `#define` it at build time to explore. Setting it to 1 reproduces the
+historical schedule exactly, which is how the refactor itself was verified —
+batch 1 is bit-identical to the pre-batch build.
+
+`compare_native.py` passes, and the exact-match rate against the Python
+reference is 42.56% versus 42.57% before batching: the batched core is no
+further from the reference than the unbatched one was.
+
+### Still untried
 - Native ARM64 build (this host is ARM64; the toolchain target is not
   installed). Irrelevant to low-end x86, which was the actual question.
 - `EMULATOR_INSTANCES = 3` costs ~0.9s of startup and 3x memory but buys no
