@@ -286,6 +286,53 @@ def _terminate(text):
 	return text + ","
 
 
+# Longest input line the firmware accepts. Measured: payloads up to 133 bytes
+# speak in full and grow linearly with length; at 136 and beyond the output
+# collapses to a fixed ~1.74s stub regardless of how much was sent. 120 leaves
+# margin rather than sitting on a cliff whose exact edge is between the two.
+FIRMWARE_LINE_BYTES = 120
+
+# Where to break an over-long line, best first. Splitting at a sentence end
+# costs nothing -- the piece still ends in real sentence punctuation. Clause
+# marks are next. A space is the last resort before a hard cut, and only a
+# single unbroken run longer than the limit reaches that.
+_SPLIT_PREFERENCE = (".!?", ",;:", " ")
+
+
+def _splitForFirmware(text, budget, firstOverhead=0):
+	"""Break text into pieces that each fit one firmware input line.
+
+	`budget` counts the whole line, so room is reserved for the terminator
+	`_terminate` may add and for the carriage return. `firstOverhead` is the
+	command prefix, which only rides on the first line.
+
+	Text already short enough comes back as a single piece, unchanged -- the
+	common case must not be perturbed.
+	"""
+	room = budget - 2                      # ",", "\r"
+	rest = (text or "").strip()
+	if not rest or len(rest) + firstOverhead <= room:
+		return [rest] if rest else []
+	pieces = []
+	limit = room - firstOverhead
+	while rest:
+		if len(rest) <= limit:
+			pieces.append(rest)
+			break
+		window = rest[:limit]
+		cut = -1
+		for chars in _SPLIT_PREFERENCE:
+			cut = max(window.rfind(c) for c in chars)
+			if cut > 0:
+				break
+		if cut <= 0:
+			cut = limit - 1                # one unbroken run: cut it
+		pieces.append(rest[:cut + 1].strip())
+		rest = rest[cut + 1:].strip()
+		limit = room
+	return [p for p in pieces if p]
+
+
 def _cleanText(text):
 	"""Fold to the 7-bit ASCII the 1984 firmware understands, then neutralise
 	square brackets so user text can't be mistaken for a command sequence."""
@@ -1168,8 +1215,33 @@ class SynthDriver(SynthDriver):
 		st["worstGapMs"] = 0.0
 
 	def _speakChunk(self, generation, text):
-		"""Feed one chunk and pump its audio right through. Returns False if
-		cancelled.
+		"""Speak one chunk, splitting it to fit the firmware. False if cancelled.
+
+		The firmware silently discards an input line past ~134 bytes -- output
+		collapses to a fixed ~1.7s stub however much longer the text is, so a
+		long list item or chat message lost most of its content and sometimes
+		produced nothing audible at all.
+
+		The pieces are spoken one at a time rather than handed over together:
+		the firmware's buffer holds only about two lines, so writing them all
+		at once merely moves the loss further out (299 and 500 characters both
+		capped at the same 14.4s). Feeding the next line only after the
+		previous has been pumped is what say all has always done between
+		lines, so the resulting cadence is already known to be acceptable.
+		"""
+		prefix = self._commandPrefix()
+		# The prefix rides on the first line only, so it eats into that line's
+		# budget and no other. After the first, _speakLine finds it already in
+		# effect on this instance and sends nothing.
+		head = 0 if self._lastPrefix.get(self._activeIdx) == prefix else len(prefix) + 1
+		for piece in _splitForFirmware(text, FIRMWARE_LINE_BYTES, head):
+			if not self._speakLine(generation, piece):
+				return False
+		return True
+
+	def _speakLine(self, generation, text):
+		"""Feed one firmware-sized line and pump its audio right through.
+		Returns False if cancelled.
 
 		This always speaks what it is given, to completion. Line joining is
 		done upstream in _renderSmooth by accumulating text until a sentence
@@ -1193,8 +1265,9 @@ class SynthDriver(SynthDriver):
 			"ascii", "replace")
 		machine.feed_text(payload)
 		if self._trace:
-			log.info("DTC-01 trace:   -> inst %d fed %r"
-					 % (self._activeIdx, _snip(payload.decode("ascii", "replace"), 80)))
+			log.info("DTC-01 trace:   -> inst %d fed %d bytes %r"
+					 % (self._activeIdx, len(payload),
+						_snip(payload.decode("ascii", "replace"), 80)))
 
 		booster = self._booster
 		booster.speed = self._rateParams()[1]

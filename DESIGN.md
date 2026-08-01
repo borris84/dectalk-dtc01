@@ -1173,6 +1173,68 @@ firmware (README documents this). Either keep a dump in
 `<NVDA config>/dectalkDtc01/roms/`, which survives updates and outranks the
 bundled copy, or re-install a fresh `--with-roms` package.
 
+## 19. THE missing-phrase bug (2026-08-01) — firmware input line limit
+
+**The firmware silently discards an input line past ~134 bytes.** Output does
+not truncate proportionally: it collapses to a fixed ~1.74s stub regardless of
+how much longer the text is. Measured on a clean machine per case:
+
+| payload bytes | audio |
+|---|---|
+| 121 | 8.23s |
+| 133 | 8.89s |
+| **136** | **1.74s** |
+| 203 | 1.74s |
+| 500 | 1.74s |
+
+Below the limit, duration grows linearly with length exactly as expected. The
+cliff sits between 133 and 136 bytes, counting the command prefix and the
+terminating `,\r`. `FIRMWARE_LINE_BYTES = 120` leaves margin.
+
+This had been present from the beginning and explains every "phrase went
+missing" report: list items and chat messages routinely run 150–250
+characters, so most of the content was lost and the stub often fell below the
+silence threshold, logging as `0.00s audio fed`.
+
+### The fix
+
+`_speakChunk` splits over-long text with `_splitForFirmware` and speaks the
+pieces **one at a time**, each pumped before the next is fed. Splitting alone
+is not enough: the firmware's buffer holds only about two lines, so writing
+all the pieces in one go merely moves the loss further out (299 and 500
+characters both capped at the same 14.4s). Pacing is what say all has always
+done between lines, so the cadence was already known-good.
+
+Splits prefer sentence enders, then clause marks, then spaces
+(`_SPLIT_PREFERENCE`). A say-all chunk is usually several complete sentences,
+so it splits at real full stops and costs nothing prosodically. Only a single
+sentence longer than the limit gets a break that was not already there — and
+today that sentence produces almost nothing at all.
+
+Verified through the real driver, not a simulation: seconds-per-character is
+constant (0.053–0.056) from 47 to 899 characters, versus flat 1.74s past 131
+before. `sayall_sim` is unchanged at 5.30s vs 5.35s ideal.
+
+### Method note — three wrong answers before this one
+
+Each was killed by measurement, and each had come from reasoning:
+
+1. **Punctuation** (`"` looked guilty, 5.13s → 3.40s). Artifact: one emulator
+   instance reused across cases, so each measurement absorbed the previous
+   utterance's tail. With a fresh machine per case, quotes, apostrophes and
+   colons make no difference whatever.
+2. **Feeding faster than the firmware consumes.** Throttling made it *worse*
+   (1.24–2.76s vs 3.44s), which rules out rate.
+3. **Missing XON/XOFF.** The firmware sends no XOFF. It does maintain a DUART
+   output port that nothing reads (`duart2681.c:279`), which is a real gap but
+   not this bug.
+
+A fourth near-miss: simulating the fix with an ad-hoc "finished" test of 0.5s
+silence gave nonsense (167 characters scoring lower than 131), because an
+utterance can legitimately go quiet for 0.54s mid-way. **Drive the real
+SynthDriver.** Its `_pump` already knows what finished means; hand-rolled
+equivalents in a test script do not.
+
 ## 8. Open follow-ups (not yet resolved — do not assume)
 
 - ~~Built-in voice table~~ **RESOLVED 2026-07-28**: see section 6b above.
