@@ -95,7 +95,14 @@ DRAIN_MAX_BLOCKS = 1600     # 40s emulated (~4s wall at ~10x)
 # text finishes well within this, which keeps the instance clean and avoids
 # burning a spare -- important when typing, where cancels come faster than
 # dirty instances can be recycled. Longer text overruns it and we swap.
-QUICK_DRAIN_BLOCKS = 40     # 1s emulated (~100ms wall)
+# Expressed in emulated blocks so behaviour is host-independent -- but the
+# *wall* cost of a given budget falls as the core gets faster. 40 was chosen as
+# "~100ms wall at ~10x"; at ~19.7x it spends only ~51ms, leaving half the
+# intended budget unused. Measured swap rate on echo-length text cancelled
+# after 4 blocks: 40 -> 53%, 80 -> 20%, 120 -> 0%. 80 restores the wall cost
+# the value was picked for; 120 would exceed the cancelled-keystroke latency
+# budget already tuned below.
+QUICK_DRAIN_BLOCKS = 80     # 2s emulated (~100ms wall at ~19.7x)
 # ...but give up much sooner if the abandoned utterance had not even started
 # speaking, since then we're just waiting on letter-to-sound with nothing to
 # reclaim. This is the difference between ~120ms and ~60ms of added latency
@@ -167,6 +174,42 @@ def _candidateRomDirs():
 		if appdata:
 			yield os.path.join(appdata, "nvda", "dectalkDtc01", "roms")
 	yield os.path.join(_HERE, "roms")
+
+
+TRACE_FLAG_NAME = "dectalkDtc01/trace.flag"
+
+
+def _configDir():
+	"""NVDA's user config directory, or None outside NVDA."""
+	try:
+		import globalVars
+		return globalVars.appArgs.configPath
+	except Exception:
+		appdata = os.environ.get("APPDATA")
+		return os.path.join(appdata, "nvda") if appdata else None
+
+
+def _traceEnabled():
+	"""True if <NVDA config>/dectalkDtc01/trace.flag exists.
+
+	A flag file rather than a setting, because this is a diagnostic and the
+	settings panel is deliberately kept short; and rather than NVDA's global
+	debug level, which is noisy enough to perturb the timing that a
+	speech-timing bug depends on. Checked once, at driver construction.
+	"""
+	base = _configDir()
+	if not base:
+		return False
+	try:
+		return os.path.isfile(os.path.join(base, "dectalkDtc01", "trace.flag"))
+	except Exception:
+		return False
+
+
+def _snip(text, limit=60):
+	"""Shorten text for a log line, showing that it was shortened."""
+	text = str(text).replace("\r", "\\r").replace("\n", "\\n")
+	return text if len(text) <= limit else text[:limit] + "..."
 
 
 def findRomDir(refresh=False):
@@ -328,8 +371,17 @@ class SynthDriver(SynthDriver):
 			"utterances": 0, "cancels": 0, "quickDrainOk": 0, "swaps": 0,
 			"fallbacks": 0, "resets": 0, "fallbackSeconds": 0.0,
 			"slowBlocks": 0, "blocks": 0, "worstGapMs": 0.0, "stops": 0,
+			# Utterances NVDA queued that a cancel threw away before they were
+			# ever spoken. Counted always, because "a phrase went missing" is
+			# indistinguishable from normal operation without it.
+			"discarded": 0,
 		}
+		self._trace = _traceEnabled()
+		self._uttSeq = 0
+		if self._trace:
+			log.info("DTC-01: utterance tracing ON (%s exists)" % TRACE_FLAG_NAME)
 		self._fedSinceStop = False
+		self._samplesFed = 0     # cumulative 16-bit samples delivered to NVDA
 		self._lastStatsLog = 0
 		self._lastStatsTime = time.monotonic()
 		self._machines = []
@@ -609,27 +661,55 @@ class SynthDriver(SynthDriver):
 				events.append(("index", item.index))
 		flush()
 		if not events:
+			if self._trace:
+				log.info("DTC-01 trace: speak() produced no events from %r"
+						 % _snip("".join(str(i) for i in speechSequence if isinstance(i, str))))
 			return
 		with self._stateLock:
 			generation = self._generation
-		self._jobs.put((generation, events))
+			self._uttSeq += 1
+			uttId = self._uttSeq
+		if self._trace:
+			said = " | ".join(_snip(v) for k, v in events if k == "text")
+			log.info("DTC-01 trace: speak #%d gen=%d -> %r" % (uttId, generation, said))
+		self._jobs.put((generation, events, uttId))
 
 	def cancel(self):
 		with self._stateLock:
 			self._generation += 1
 			self._needsDrain = True
 			self._stats["cancels"] += 1
+		# Anything still queued here is speech NVDA asked for that will never
+		# be spoken. Usually correct -- the user moved on -- but it is also the
+		# most likely way a phrase goes missing, so it is always counted and,
+		# when tracing, named.
+		discarded = []
 		while True:
 			try:
-				self._jobs.get_nowait()
+				job = self._jobs.get_nowait()
 				self._jobs.task_done()
+				discarded.append(job)
 			except queue.Empty:
 				break
+		# terminate() puts a None sentinel on this same queue, so a cancel
+		# racing shutdown can pull it out. Keep it out of the count and, more
+		# importantly, out of the unpacking below.
+		discarded = [j for j in discarded if j is not None]
+		if discarded:
+			with self._stateLock:
+				self._stats["discarded"] += len(discarded)
+			if self._trace:
+				for _gen, events, uttId in discarded:
+					said = " | ".join(_snip(v) for k, v in events if k == "text")
+					log.info("DTC-01 trace: DISCARDED #%d by cancel -> %r" % (uttId, said))
 		# Only reset the device if we have actually queued audio since the
 		# last reset. With key echo, cancel() fires on every keystroke --
 		# hundreds of times a minute -- and each stop() is a real operation
 		# on the output stream. Skipping the no-op ones removes a large
 		# amount of needless churn from the audio path.
+		if self._pendingText and self._trace:
+			log.info("DTC-01 trace: DROPPED held fragment by cancel -> %r"
+					 % _snip(self._pendingText))
 		self._pendingText = ""   # interrupted: don't speak held fragments later
 		self._booster.reset()
 		if self._fedSinceStop:
@@ -924,9 +1004,13 @@ class SynthDriver(SynthDriver):
 					return
 				if self._machine is None:
 					continue
-				generation, events = job
+				generation, events, uttId = job
 				if self._isCurrent(generation):
-					self._render(generation, events)
+					self._render(generation, events, uttId)
+				elif self._trace:
+					said = " | ".join(_snip(v) for k, v in events if k == "text")
+					log.info("DTC-01 trace: STALE #%d (gen %d) never rendered -> %r"
+							 % (uttId, generation, said))
 			except Exception:
 				log.error("DTC-01: synthesis failed", exc_info=True)
 			finally:
@@ -941,15 +1025,24 @@ class SynthDriver(SynthDriver):
 			return
 		self._pump(machine, maxBlocks=DRAIN_MAX_BLOCKS)
 
-	def _render(self, generation, events):
+	def _render(self, generation, events, uttId=-1):
 		# The stats call has to be in a finally: nearly every utterance is
 		# cancelled when key echo is on, and each of those takes an early
 		# return below. With the call at the end it was only reached by
 		# utterances that ran to completion, so during exactly the workload
 		# worth measuring it never logged anything at all.
+		started = self._samplesFed
 		try:
 			self._renderInner(generation, events)
 		finally:
+			if self._trace:
+				# Outcome as observed, not as intended: whether audio actually
+				# reached the device is the fact that separates "spoken" from
+				# "silently dropped", and it is not visible anywhere else.
+				log.info("DTC-01 trace: end #%d %s, %.2fs audio fed"
+						 % (uttId,
+							"complete" if self._isCurrent(generation) else "superseded",
+							(self._samplesFed - started) / float(SAMPLE_RATE)))
 			self._maybeLogStats()
 
 	def _renderInner(self, generation, events):
@@ -1064,11 +1157,11 @@ class SynthDriver(SynthDriver):
 		self._lastStatsTime = now
 		slowPct = (100.0 * st["slowBlocks"] / st["blocks"]) if st["blocks"] else 0.0
 		log.info(
-			"DTC-01 stats: utterances=%d cancels=%d | quickDrainOk=%d swaps=%d "
-			"fallbacks=%d resets=%d fallbackTime=%.2fs | blocks=%d late=%d (%.1f%%) "
-			"worstGap=%.0fms | stops=%d | dirty=%d/%d"
-			% (st["utterances"], st["cancels"], st["quickDrainOk"], st["swaps"],
-			   st["fallbacks"], st["resets"], st["fallbackSeconds"],
+			"DTC-01 stats: utterances=%d cancels=%d discarded=%d | quickDrainOk=%d "
+			"swaps=%d fallbacks=%d resets=%d fallbackTime=%.2fs | blocks=%d "
+			"late=%d (%.1f%%) worstGap=%.0fms | stops=%d | dirty=%d/%d"
+			% (st["utterances"], st["cancels"], st["discarded"], st["quickDrainOk"],
+			   st["swaps"], st["fallbacks"], st["resets"], st["fallbackSeconds"],
 			   st["blocks"], st["slowBlocks"], slowPct, st["worstGapMs"],
 			   st["stops"], sum(self._dirty), len(self._machines))
 		)
@@ -1099,6 +1192,9 @@ class SynthDriver(SynthDriver):
 		payload = ((prefix + " " if prefix else "") + body + "\r").encode(
 			"ascii", "replace")
 		machine.feed_text(payload)
+		if self._trace:
+			log.info("DTC-01 trace:   -> inst %d fed %r"
+					 % (self._activeIdx, _snip(payload.decode("ascii", "replace"), 80)))
 
 		booster = self._booster
 		booster.speed = self._rateParams()[1]
@@ -1126,6 +1222,10 @@ class SynthDriver(SynthDriver):
 			# longer than a block's own duration mean the device had to wait
 			# on us, which is what audible graininess sounds like.
 			self._fedSinceStop = True
+			# Audio that actually reached the device. The trace uses this to
+			# tell a dropped utterance from a spoken one; nothing else records
+			# it, and "we sent the text" is not the same fact.
+			self._samplesFed += len(out) // 2
 			now = time.monotonic()
 			if lastFeed[0] is not None:
 				gap = (now - lastFeed[0]) * 1000.0

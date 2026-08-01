@@ -1079,6 +1079,68 @@ further from the reference than the unbatched one was.
 - `EMULATOR_INSTANCES = 3` costs ~0.9s of startup and 3x memory but buys no
   throughput — Musashi's globals serialise all three behind one lock.
 
+## 17. Session 5 (2026-08-01) — "phrases go missing": instrumented, not yet fixed
+
+Report: whole phrases occasionally never speak, "particularly lines that don't
+end with a terminator" — a list line read as just "Borris".
+
+**Not a regression from the §16 batching work.** Measured across the released
+0.5.3 DLL and batch 1/32/128, all identical: audio duration and internal gaps
+for the reported text, the block at which the driver ends an utterance,
+`is_idle` frequency (114/400 blocks) and quick-drain success rate (53%).
+`sanitize_text` passes the string through unchanged and `_terminate` guards
+empty input. Rolling back would not have helped. Do not re-blame the emulator
+without new evidence.
+
+### Two silent-drop paths in the driver
+
+Both in `cancel()`, both previously uncounted and unlogged:
+
+1. **The job queue is drained** — utterances NVDA queued that were never
+   spoken are thrown away. Usually correct (the user moved on), but if NVDA
+   sends one line as more than one `speak()` call and a cancel lands between
+   them, the remainder vanishes. Now counted as `discarded=` in the periodic
+   stats line, which is the number to look at first next time.
+2. **`_pendingText` is dropped** — the fragment smooth mode holds while
+   waiting for a sentence ender. Fits the "no terminator" description, but
+   smooth mode is gated on say-all, so it only applies there.
+
+### The trace
+
+`<NVDA config>/dectalkDtc01/trace.flag` (presence only, read once at driver
+construction) turns on one INFO line per utterance at four points: what NVDA
+handed us, what a cancel discarded, what bytes reached the firmware, and how
+much audio actually reached the device. Those four distinguish "NVDA never
+sent it" from "we discarded it" from "the firmware produced nothing" from
+"audio never got delivered" — which is the fork the report cannot be resolved
+without.
+
+A flag file rather than a settings checkbox (the panel is deliberately short)
+and rather than NVDA's global debug level, which is noisy enough to perturb
+speech timing. **Remove or demote this once the bug is found**: it records
+everything the screen reader says, which is a privacy consideration and not
+something to leave enabled by default.
+
+### `QUICK_DRAIN_BLOCKS` 40 → 80
+
+Unrelated to the report, but the §16 speedup made it free. The budget is in
+emulated blocks (host-independent), but its *wall* cost falls as the core gets
+faster: 40 was chosen as "~100ms at ~10x" and at ~19.7x spends only ~51ms.
+Measured swap rate on echo-length text cancelled after 4 blocks:
+
+| `QUICK_DRAIN_BLOCKS` | wall | swap rate |
+|---|---|---|
+| 40 | ~51ms | 53% |
+| **80** | ~102ms | **20%** |
+| 120 | ~152ms | 0% |
+
+80 restores the wall cost the constant was tuned for. 120 reaches 0% but
+exceeds the cancelled-keystroke latency budget already accepted.
+
+**This is not presented as the fix for the missing phrases** — a swap moves to
+a *clean* instance and `fallbacks=0` in every stats line, so the all-dirty
+path never ran. It reduces churn; it is not known to reduce phrase loss.
+
 ## 8. Open follow-ups (not yet resolved — do not assume)
 
 - ~~Built-in voice table~~ **RESOLVED 2026-07-28**: see section 6b above.

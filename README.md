@@ -153,6 +153,24 @@ cycles rather than every instruction, which is worth ~+82%; the DAC stays
 exactly periodic regardless. Setting it to 1 restores the historical
 one-instruction schedule. See [DESIGN.md](DESIGN.md) §16.
 
+### Diagnosing missing or truncated speech
+
+Create an empty file at:
+
+```
+%APPDATA%\nvda\dectalkDtc01\trace.flag
+```
+
+and restart NVDA. The driver then logs one line per utterance: the text NVDA
+handed over, anything a cancel discarded before it was spoken, the bytes sent
+to the firmware, and how much audio actually reached the output device. That
+distinguishes "NVDA never sent it" from "we dropped it" from "the firmware
+produced nothing". Delete the file and restart to turn it off.
+
+It is off by default, and worth turning off again afterwards — it records
+everything the screen reader speaks. The `discarded=` counter in the periodic
+`DTC-01 stats:` log line is always on and needs no flag.
+
 The pure-Python emulator in `addon/synthDrivers/dectalkDtc01/emu/` is kept as
 the readable reference implementation and correctness oracle; the C core in
 `native/` is the one fast enough to drive a screen reader.
