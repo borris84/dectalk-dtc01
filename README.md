@@ -11,7 +11,7 @@ sample set.
 
 ## Status
 
-**0.5.56 is released** — download the `.nvda-addon` from
+**0.5.57 is released** — download the `.nvda-addon` from
 [Releases](https://github.com/borris84/dectalk-dtc01/releases/latest). The
 add-on checks for later releases itself and offers to install them.
 
@@ -21,7 +21,7 @@ say-all, index reporting, and rate boost beyond the hardware's own ceiling.
 
 | | |
 |---|---|
-| Latest release | 0.5.56 |
+| Latest release | 0.5.57 |
 | Emulation speed | ~19.7x realtime (native C core, PGO build) |
 | Startup | ~0.5s to first speech |
 | Latency | ~50ms typical from request to audio |
@@ -101,16 +101,17 @@ own** machines.
 > the manifest, but the filename is not a safety mechanism. The default
 > build is the only one fit to distribute.
 
-⚠ **Rebuild after every update.** Installing a newer release over a private
-build replaces the add-on directory, and the bundled ROMs go with it. On a
-machine that has no dump of its own, the synth then stops working —
-`findRomDir` finds nothing and the driver reports no ROMs. Either re-run
-`--with-roms` for the new version and install that instead, or put a dump in
-`%APPDATA%\nvda\dectalkDtc01\roms\` on those machines, which survives
-updates and takes priority over the bundled copy.
+Installing a newer release over a private build replaces the add-on
+directory, which would take the bundled ROMs with it. **Since 0.5.57 the
+updater prevents that**: before installing it copies any bundled firmware to
+`%APPDATA%\nvda\dectalkDtc01\roms\`, which lives outside the add-on,
+survives every update, and already outranks the bundled copy in the driver's
+search order. If that copy cannot be made it asks before continuing, rather
+than removing the firmware silently.
 
-This also applies to the built-in update check, which will offer the public
-release on a machine running a private build.
+Updating a private build is therefore safe. The one case it cannot help is
+updating *from* a version older than 0.5.57, whose updater has no such
+guard — install 0.5.57 by hand on those machines first.
 
 ### Release builds use PGO
 

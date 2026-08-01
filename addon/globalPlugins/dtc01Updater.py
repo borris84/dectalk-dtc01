@@ -11,6 +11,7 @@ the check runs on a daemon thread so it cannot delay or block speech.
 """
 
 import os
+import shutil
 import threading
 import time
 import urllib.request
@@ -112,6 +113,78 @@ def _installUpdate(url, assetName, version):
 				  f"the package is downloaded at {target}", exc_info=True)
 
 
+def _bundledRomDir():
+	"""<addon>/synthDrivers/dectalkDtc01/roms, if this is a --with-roms build."""
+	addonRoot = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+	path = os.path.join(addonRoot, "synthDrivers", ADDON_NAME, "roms")
+	return path if os.path.isdir(path) else None
+
+
+def _configRomDir():
+	"""<NVDA config>/dectalkDtc01/roms -- outside the add-on, so updates never
+	touch it, and the driver prefers it over any bundled copy."""
+	try:
+		import globalVars
+		base = globalVars.appArgs.configPath
+	except Exception:
+		appdata = os.environ.get("APPDATA")
+		if not appdata:
+			return None
+		base = os.path.join(appdata, "nvda")
+	return os.path.join(base, ADDON_NAME, "roms")
+
+
+def _preserveBundledRoms():
+	"""Move a private build's firmware somewhere an update cannot destroy it.
+
+	A `--with-roms` package keeps the ROMs inside the add-on directory, and
+	installing any update replaces that directory wholesale -- so updating a
+	private build to a public release silently removed the firmware and left
+	the synth unable to start. Copying it to the config directory first makes
+	the update non-destructive: that location survives updates and already
+	outranks the bundled copy in the driver's search order, so nothing else
+	has to change.
+
+	Returns True if it is now safe to update, False if firmware would be lost.
+	"""
+	bundled = _bundledRomDir()
+	if not bundled:
+		return True                      # public build: nothing to lose
+	try:
+		names = [n for n in os.listdir(bundled)
+				 if os.path.isfile(os.path.join(bundled, n))]
+	except Exception:
+		log.error("DTC-01 updater: could not read bundled ROMs", exc_info=True)
+		return False
+	if not names:
+		return True
+	dest = _configRomDir()
+	if not dest:
+		log.error("DTC-01 updater: no config directory; cannot preserve ROMs")
+		return False
+	try:
+		existing = [n for n in os.listdir(dest)
+					if os.path.isfile(os.path.join(dest, n))] if os.path.isdir(dest) else []
+	except Exception:
+		existing = []
+	if existing:
+		# Already has its own dump, which the driver prefers anyway.
+		log.info("DTC-01 updater: %d ROM files already in %s; update is safe"
+				 % (len(existing), dest))
+		return True
+	try:
+		os.makedirs(dest, exist_ok=True)
+		for n in names:
+			shutil.copy2(os.path.join(bundled, n), os.path.join(dest, n))
+	except Exception:
+		log.error("DTC-01 updater: failed to copy bundled ROMs to %s" % dest,
+				  exc_info=True)
+		return False
+	log.info("DTC-01 updater: copied %d bundled ROM files to %s so the update "
+			 "cannot remove them" % (len(names), dest))
+	return True
+
+
 def _finishInstall(target, version):
 	"""Install the downloaded bundle. Must run on the main thread.
 
@@ -126,7 +199,20 @@ def _finishInstall(target, version):
 	   left a log saying it had been offered and nothing else.
 	"""
 	import gui
+	import wx
 	from gui import addonGui
+	# Do this before installing: the add-on directory still holds the old
+	# build's firmware until NVDA restarts and applies the staged install.
+	if not _preserveBundledRoms():
+		if gui.messageBox(
+				_("This copy of the DECtalk DTC-01 driver has firmware ROMs "
+				  "bundled inside it, and they could not be copied somewhere "
+				  "safe. Updating will remove them and the synthesizer will "
+				  "not start until you supply a ROM dump. Update anyway?"),
+				_("DECtalk DTC-01 update"),
+				wx.YES_NO | wx.ICON_WARNING) != wx.YES:
+			log.info("DTC-01 updater: update declined to protect bundled ROMs")
+			return
 	try:
 		installed = addonGui.installAddon(gui.mainFrame, target)
 	except Exception:
@@ -146,7 +232,6 @@ def _finishInstall(target, version):
 		return
 	# Older/newer NVDA without that helper: ask plainly rather than leaving the
 	# update silently pending, which is the bug this function exists to fix.
-	import wx
 	if gui.messageBox(
 			_("The DECtalk DTC-01 driver has been updated to version {version}. "
 			  "NVDA must restart for the change to take effect. Restart now?"
